@@ -3,6 +3,8 @@ node_modules/
 
 # Build
 dist/
+# Generated for Vercel static output (see scripts/sync-public-for-vercel.cjs)
+public/index.html
 *.tsbuildinfo
 
 # Environment (keep .env.example tracked)

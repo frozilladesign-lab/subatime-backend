@@ -1,0 +1,12 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "npm install && npx prisma generate",
+  "buildCommand": "npm run build",
+  "outputDirectory": "public",
+  "functions": {
+    "api/[[...path]].ts": {
+      "includeFiles": "{dist/**,prisma/schema.prisma,node_modules/@prisma/client/**,node_modules/.prisma/client/**,node_modules/@swisseph/node/**}",
+      "maxDuration": 60
+    }
+  }
+}
