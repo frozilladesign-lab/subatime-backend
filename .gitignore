@@ -31,3 +31,4 @@ coverage/
 # Prisma (optional local DB dumps)
 *.db
 *.db-journal
+.vercel

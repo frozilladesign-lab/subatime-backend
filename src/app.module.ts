@@ -14,6 +14,7 @@ import { PrismaModule } from './database/prisma.module';
 import { DreamModule } from './modules/dream/dream.module';
 import { SubatimeModule } from './modules/subatime/subatime.module';
 import { CalendarModule } from './modules/calendar/calendar.module';
+import { HealthController } from './health.controller';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { CalendarModule } from './modules/calendar/calendar.module';
     DreamModule,
     SubatimeModule,
   ],
+  controllers: [HealthController],
   providers: [AppConfigService],
 })
 export class AppModule {}
