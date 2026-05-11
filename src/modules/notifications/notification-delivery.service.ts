@@ -56,6 +56,13 @@ export class NotificationDeliveryService {
       jobId,
       type: String(notification.type),
     };
+    const fcmExtra = payload.fcmData;
+    if (fcmExtra != null && typeof fcmExtra === 'object' && !Array.isArray(fcmExtra)) {
+      for (const [k, v] of Object.entries(fcmExtra as Record<string, unknown>)) {
+        if (v === undefined || v === null) continue;
+        data[String(k)] = String(v);
+      }
+    }
 
     try {
       const tokenStrings = tokens.map((t) => t.token);

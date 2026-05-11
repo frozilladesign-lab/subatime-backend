@@ -13,6 +13,7 @@ import { UserModule } from './modules/user/user.module';
 import { PrismaModule } from './database/prisma.module';
 import { DreamModule } from './modules/dream/dream.module';
 import { SubatimeModule } from './modules/subatime/subatime.module';
+import { CalendarModule } from './modules/calendar/calendar.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { SubatimeModule } from './modules/subatime/subatime.module';
     BirthProfileModule,
     UserModule,
     AstrologyModule,
+    CalendarModule,
     AiModule,
     MatchingModule,
     NotificationsModule,

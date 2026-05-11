@@ -601,6 +601,11 @@ export class SubatimeService {
         typeof ulRaw === 'string' && ulRaw.trim().length > 0 ? ulRaw.trim() : null;
       const slotRaw = payload.slot;
       const slot = typeof slotRaw === 'string' && slotRaw.trim().length > 0 ? slotRaw.trim() : null;
+      const pidRaw = payload.predictionId;
+      const predictionId =
+        typeof pidRaw === 'string' && pidRaw.trim().length > 0 ? pidRaw.trim() : null;
+      const dateRaw = payload.date;
+      const planDate = typeof dateRaw === 'string' && dateRaw.trim().length > 0 ? dateRaw.trim() : null;
       return {
         id: j.id,
         type: String(j.type),
@@ -610,6 +615,8 @@ export class SubatimeService {
         unread: !j.isRead,
         ...(userLagna ? { userLagna } : {}),
         ...(slot ? { slot } : {}),
+        ...(predictionId ? { predictionId } : {}),
+        ...(planDate ? { planDate } : {}),
       };
     });
     return okResponse(items, 'Notifications fetched');

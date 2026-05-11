@@ -1,4 +1,4 @@
-import { IsOptional, IsString, ValidateIf } from 'class-validator';
+import { IsIn, IsOptional, IsString, ValidateIf } from 'class-validator';
 
 export class GenerateChartDto {
   @IsOptional()
@@ -35,4 +35,23 @@ export class GenerateChartDto {
   @IsOptional()
   @IsString()
   timezone?: string;
+
+  /** Whole-sign rising override (Mesha…Meena); rotates houses vs computed ascendant. */
+  @IsOptional()
+  @IsString()
+  @IsIn([
+    'Mesha',
+    'Vrishabha',
+    'Mithuna',
+    'Karka',
+    'Simha',
+    'Kanya',
+    'Tula',
+    'Vrischika',
+    'Dhanu',
+    'Makara',
+    'Kumbha',
+    'Meena',
+  ])
+  lagnaUserOverride?: string;
 }

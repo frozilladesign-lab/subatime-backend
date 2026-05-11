@@ -4,7 +4,8 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  /// Supabase: transaction pooler `:6543?pgbouncer=true`. If `migrate deploy` hits session-pool limits, run `npm run prisma:migrate:apply-transaction`.
+  url = env("DATABASE_URL")
 }
 
 enum Language {
@@ -23,6 +24,7 @@ enum NotificationType {
   daily_night
   warning
   event
+  proactive_hora
 }
 
 enum NotificationStatus {
@@ -63,6 +65,8 @@ model User {
   name               String
   email              String               @unique
   passwordHash       String?
+  /// Optional: male | female | non_binary | unspecified (from onboarding).
+  gender             String?
   language           Language             @default(si)
   accuracyScore      Float                @default(0.5)
   /// Client-owned JSON (e.g. `{ "adaptation": { "depth", "sensitivity", "dreamDepth", "strictness" } }`). Merged via PATCH.
@@ -154,6 +158,8 @@ model BirthProfile {
   longitude    Float
   lagna        String?
   nakshatra    String?
+  /// Optional: user-confirmed whole-sign rising (Mesha…Meena); rotates chart houses vs computed ascendant.
+  userKnownLagna String?
   /// UX-only onboarding preference (love/career/growth/dreams); biases prediction personalization.
   onboardingIntent String?
   /// exact | approx | unknown — how birth time was captured.

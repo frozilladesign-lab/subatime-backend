@@ -1,8 +1,10 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { DateTime } from 'luxon';
 import { PrismaService } from '../../../database/prisma.service';
-import { ChartService } from '../../astrology/services/chart.service';
+import { taraIndex1to9, taraNameEn } from '../../astrology/jyotisha-tara';
+import { ChartService, NAKSHATRA_LIST } from '../../astrology/services/chart.service';
 import { NotificationQueueService } from '../../notifications/queue/notification.queue';
 import { GenerateChartDto } from '../../astrology/dto/astrology.dto';
 import { okResponse } from '../../../common/utils/response.util';
@@ -46,6 +48,10 @@ export interface DailyPredictionOutput {
       | 'weighted-score-v2+gemini'
       | 'weighted-score-v3'
       | 'weighted-score-v3+gemini';
+    /** Sidereal Moon sign (Janma Rāśi) from birth chart. */
+    janmaRasi?: string;
+    /** Tara Bāla at local civil noon in birth-profile timezone (approximate daily snapshot). */
+    taraAtBirthTimezoneNoon?: { index1To9: number; name: string };
   };
 }
 
@@ -151,7 +157,7 @@ export class DailyPredictionService {
 
     await this.feedbackLearning.recomputeUserAccuracy(userId);
     // Make feedback affect the very next read by regenerating today's prediction.
-    await this.generateForUser(userId, this.todayUTC());
+    await this.generateForUser(userId, this.todayUTC(), { forceRegenerate: true });
 
     return okResponse(saved, 'Feedback captured');
   }
@@ -228,13 +234,17 @@ export class DailyPredictionService {
     }
 
     const contextWeights = await this.feedbackLearning.getUserContextWeights(userId);
-    const profile = await this.prisma.birthProfile.findUnique({
-      where: { userId },
-      select: { onboardingIntent: true },
+    const userRow = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        preferences: true,
+        birthProfile: { select: { onboardingIntent: true } },
+      },
     });
     const personalization = this.buildPersonalization(
       contextWeights,
-      profile?.onboardingIntent,
+      userRow?.birthProfile?.onboardingIntent,
+      this.readOnboardingMoodsFromPreferences(userRow?.preferences),
     );
 
     const facts = {
@@ -304,7 +314,7 @@ export class DailyPredictionService {
     });
 
     for (const user of users) {
-      await this.generateForUser(user.id, date);
+      await this.generateForUser(user.id, date, { forceRegenerate: true });
     }
 
     this.logger.log(`Generated predictions for ${users.length} users on ${date.toISOString()}`);
@@ -313,13 +323,30 @@ export class DailyPredictionService {
 
   /**
    * @param opts.polishSummary When false, skips Gemini summary polish (faster for calendar month backfill).
+   * @param opts.forceRegenerate When true, skips the DB cache and recomputes (cron, feedback refresh).
    */
   async generateForUser(
     userId: string,
     date: Date,
-    opts?: { polishSummary?: boolean },
+    opts?: { polishSummary?: boolean; forceRegenerate?: boolean },
   ): Promise<DailyPredictionOutput | null> {
     const polishSummary = opts?.polishSummary !== false;
+    const predictionDay = this.normalizeDate(date);
+
+    if (!opts?.forceRegenerate) {
+      const cached = await this.prisma.dailyPrediction.findUnique({
+        where: {
+          userId_date: {
+            userId,
+            date: predictionDay,
+          },
+        },
+      });
+      if (cached) {
+        return this.enrichPrediction(cached, userId);
+      }
+    }
+
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: {
@@ -359,8 +386,8 @@ export class DailyPredictionService {
     const personalization = this.buildPersonalization(
       contextWeights,
       user.birthProfile?.onboardingIntent,
+      this.readOnboardingMoodsFromPreferences(user.preferences),
     );
-    const predictionDay = this.normalizeDate(date);
     const dataQuality = this.dataQualityFromBirthProfile(user.birthProfile);
     const scored = this.scoringEngine.scoreBlocks({
       blocks,
@@ -452,6 +479,13 @@ export class DailyPredictionService {
     });
 
     const lagnaTrim = lagna.trim();
+    const janmaRasi = String(planetaryData['moon'] ?? '').trim();
+    const dateStr = this.toDateString(predictionDate);
+    const tzNoon = user.birthProfile?.timezone ?? 'UTC';
+    const ayanamsaMode =
+      typeof cd?.ayanamsaMode === 'string' ? (cd.ayanamsaMode as string) : undefined;
+    const taraNoon = this.computeTaraAtLocalNoon(nakshatra, dateStr, tzNoon, ayanamsaMode);
+
     const metaBase = {
       predictionId: dailyPrediction.id,
       date: this.toDateString(predictionDate),
@@ -488,9 +522,13 @@ export class DailyPredictionService {
       summary: summary.length > 200 ? `${summary.slice(0, 197)}…` : summary,
     };
 
+    const muteLearningTips = this.muteLearningTipsFromPreferences(user.preferences);
+
     await this.upsertDaypartNotification(userId, 'daily', predictionDate, 7, morningPayload);
-    await this.upsertDaypartNotification(userId, 'daily_evening', predictionDate, 14, eveningPayload);
-    await this.upsertDaypartNotification(userId, 'daily_night', predictionDate, 22, nightPayload);
+    if (!muteLearningTips) {
+      await this.upsertDaypartNotification(userId, 'daily_evening', predictionDate, 14, eveningPayload);
+      await this.upsertDaypartNotification(userId, 'daily_night', predictionDate, 22, nightPayload);
+    }
 
     return {
       predictionId: dailyPrediction.id,
@@ -507,6 +545,8 @@ export class DailyPredictionService {
         nakshatra,
         scoreSpread,
         method: summaryMethod,
+        ...(janmaRasi.length ? { janmaRasi } : {}),
+        ...(taraNoon ? { taraAtBirthTimezoneNoon: taraNoon } : {}),
       },
     };
   }
@@ -520,6 +560,7 @@ export class DailyPredictionService {
       latitude: number;
       longitude: number;
       timezone: string | null;
+      userKnownLagna?: string | null;
     },
   ): GenerateChartDto {
     return {
@@ -530,7 +571,15 @@ export class DailyPredictionService {
       latitude: profile.latitude,
       longitude: profile.longitude,
       timezone: profile.timezone ?? undefined,
+      lagnaUserOverride: profile.userKnownLagna?.trim() || undefined,
     };
+  }
+
+  private readOnboardingMoodsFromPreferences(raw: unknown): string[] {
+    if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return [];
+    const m = (raw as Record<string, unknown>).onboardingMoods;
+    if (!Array.isArray(m)) return [];
+    return m.map((x) => String(x).trim()).filter(Boolean);
   }
 
   private buildTimeBlocks(): TimeBlock[] {
@@ -626,9 +675,18 @@ export class DailyPredictionService {
     return `Based on ${lagna} lagna and ${nakshatra}, your strongest action window is ${blockLabel}. ${angle} ${contextLine}`;
   }
 
+  private muteLearningTipsFromPreferences(raw: unknown): boolean {
+    if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return false;
+    const n = (raw as Record<string, unknown>).notifications;
+    if (n == null || typeof n !== 'object' || Array.isArray(n)) return false;
+    const m = (n as Record<string, unknown>).muteLearningTips;
+    return m === true || m === 'true';
+  }
+
   private buildPersonalization(
     contextWeights: Record<string, number>,
     onboardingIntent?: string | null,
+    onboardingMoods?: string[] | null,
   ): PredictionPersonalization {
     const boosted: Record<string, number> = { ...contextWeights };
     const bump = (key: ContextKey, delta: number) => {
@@ -636,22 +694,57 @@ export class DailyPredictionService {
         Math.min(0.95, Math.max(0.15, (boosted[key] ?? 0.5) + delta)).toFixed(4),
       );
     };
-    switch (onboardingIntent) {
-      case 'love':
-        bump('love', 0.22);
-        break;
-      case 'career':
-        bump('career', 0.22);
-        break;
-      case 'growth':
-        bump('health', 0.14);
-        bump('overall', 0.1);
-        break;
-      case 'dreams':
-        bump('overall', 0.18);
-        break;
-      default:
-        break;
+    const intents = (onboardingIntent ?? '')
+      .split(/[,]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    for (const intent of intents) {
+      switch (intent) {
+        case 'love':
+          bump('love', 0.22);
+          break;
+        case 'career':
+          bump('career', 0.22);
+          break;
+        case 'growth':
+          bump('health', 0.14);
+          bump('overall', 0.1);
+          break;
+        case 'dreams':
+          bump('overall', 0.18);
+          break;
+        default:
+          break;
+      }
+    }
+
+    for (const raw of onboardingMoods ?? []) {
+      const id = raw.trim().toLowerCase();
+      switch (id) {
+        case 'calm':
+          bump('overall', 0.08);
+          bump('health', 0.06);
+          break;
+        case 'anxious':
+          bump('health', 0.14);
+          bump('overall', 0.04);
+          break;
+        case 'focused':
+          bump('career', 0.14);
+          break;
+        case 'tired':
+          bump('health', 0.12);
+          break;
+        case 'open':
+          bump('love', 0.1);
+          bump('overall', 0.08);
+          break;
+        case 'stressed':
+          bump('health', 0.14);
+          break;
+        default:
+          break;
+      }
     }
 
     const contexts: ContextKey[] = ['career', 'love', 'health', 'overall'];
@@ -689,6 +782,7 @@ export class DailyPredictionService {
       badTimes: unknown;
       transits?: unknown;
       confidenceScore: number;
+      scoreSpread: number;
       createdAt: Date;
       updatedAt: Date;
       id: string;
@@ -696,31 +790,39 @@ export class DailyPredictionService {
     userId: string,
   ) {
     const contextWeights = await this.feedbackLearning.getUserContextWeights(userId);
-    const profile = await this.prisma.birthProfile.findUnique({
-      where: { userId },
-      select: {
-        id: true,
-        onboardingIntent: true,
-        updatedAt: true,
-        placeOfBirth: true,
-        latitude: true,
-        longitude: true,
-        timezone: true,
-        birthLocalDate: true,
-        birthLocalTime: true,
-        dateOfBirth: true,
-        timeOfBirth: true,
-      },
-    });
+    const [profile, prefsRow] = await Promise.all([
+      this.prisma.birthProfile.findUnique({
+        where: { userId },
+        select: {
+          id: true,
+          onboardingIntent: true,
+          updatedAt: true,
+          placeOfBirth: true,
+          latitude: true,
+          longitude: true,
+          timezone: true,
+          birthLocalDate: true,
+          birthLocalTime: true,
+          dateOfBirth: true,
+          timeOfBirth: true,
+          userKnownLagna: true,
+        },
+      }),
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { preferences: true },
+      }),
+    ]);
     const personalization = this.buildPersonalization(
       contextWeights,
       profile?.onboardingIntent,
+      this.readOnboardingMoodsFromPreferences(prefsRow?.preferences),
     );
 
     let lagna = '';
     let nakshatra = '';
-    let siderealSun = '';
     let siderealMoon = '';
+    let taraNoon: { index1To9: number; name: string } | undefined;
     if (profile?.id) {
       let chart = await this.prisma.astrologyChart.findFirst({
         where: { birthProfileId: profile.id },
@@ -740,6 +842,7 @@ export class DailyPredictionService {
           longitude: profile.longitude,
           timezone: profile.timezone ?? 'UTC',
           ayanamsa: 'lahiri',
+          lagnaUserOverride: profile.userKnownLagna ?? undefined,
         });
         const version = (chart?.version ?? 0) + 1;
         chart = await this.prisma.astrologyChart.create({
@@ -755,23 +858,63 @@ export class DailyPredictionService {
       if (cd?.lagna != null) lagna = String(cd.lagna);
       if (cd?.nakshatra != null) nakshatra = String(cd.nakshatra);
       const pd = chart?.planetaryData as Record<string, unknown> | undefined;
-      if (pd?.sun != null) siderealSun = String(pd.sun);
       if (pd?.moon != null) siderealMoon = String(pd.moon);
+      const dateStr = prediction.date.toISOString().slice(0, 10);
+      const tz = profile.timezone ?? 'UTC';
+      const ay = typeof cd?.ayanamsaMode === 'string' ? (cd.ayanamsaMode as string) : undefined;
+      if (nakshatra.trim().length > 0) {
+        taraNoon = this.computeTaraAtLocalNoon(nakshatra, dateStr, tz, ay);
+      }
     }
 
-    return {
-      ...prediction,
+    const goodTimes = (prediction.goodTimes as unknown as TimeBlock[]) ?? [];
+    const badTimes = (prediction.badTimes as unknown as TimeBlock[]) ?? [];
+    const spread = Number.isFinite(prediction.scoreSpread)
+      ? Number(prediction.scoreSpread)
+      : 0.35;
+
+    const out: DailyPredictionOutput = {
       predictionId: prediction.id,
+      userId: prediction.userId,
+      date: this.toDateString(prediction.date),
+      summary: prediction.summary,
+      goodTimes,
+      badTimes,
       transits: this.normalizeStoredTransits(prediction.transits),
+      confidenceScore: prediction.confidenceScore,
       personalization,
       meta: {
         lagna,
         nakshatra,
-        siderealSun,
-        siderealMoon,
-        chartSystem: 'vedic_sidereal',
+        scoreSpread: spread,
+        method: 'weighted-score-v3',
+        ...(siderealMoon.trim().length > 0 ? { janmaRasi: siderealMoon.trim() } : {}),
+        ...(taraNoon ? { taraAtBirthTimezoneNoon: taraNoon } : {}),
       },
     };
+    return out;
+  }
+
+  /** Tara Bāla: count nakṣatras from birth star to transiting Moon at local civil noon (birth TZ). */
+  private computeTaraAtLocalNoon(
+    natalNakName: string,
+    dateStr: string,
+    tz: string,
+    ayanamsaMode?: string,
+  ): { index1To9: number; name: string } | undefined {
+    const natIdx = (NAKSHATRA_LIST as readonly string[]).indexOf(natalNakName.trim());
+    if (natIdx < 0) return undefined;
+    const localNoon = DateTime.fromISO(`${dateStr}T12:00:00`, { zone: tz });
+    if (!localNoon.isValid) return undefined;
+    const moon = this.chartService.moonSiderealLongitudeUtc(localNoon.toUTC().toJSDate(), ayanamsaMode);
+    const trIdx = Math.floor(this.normDeg360(moon) / (360 / 27));
+    const ti = taraIndex1to9(natIdx, trIdx);
+    return { index1To9: ti, name: taraNameEn(ti) };
+  }
+
+  private normDeg360(v: number): number {
+    const n = v % 360;
+    return n < 0 ? n + 360 : n;
   }
 
   private normalizeStoredTransits(raw: unknown): DayTransitDto[] {

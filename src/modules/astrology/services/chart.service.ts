@@ -22,7 +22,8 @@ import {
 } from '@swisseph/node';
 import { GenerateChartDto } from '../dto/astrology.dto';
 
-const SIDEREAL_SIGNS = [
+/** 12 Nirayana rāśi names (whole signs); used for Janma Rāśi etc. */
+export const SIDEREAL_SIGNS = [
   'Mesha',
   'Vrishabha',
   'Mithuna',
@@ -168,6 +169,32 @@ export class ChartService implements OnModuleDestroy {
     }
   }
 
+  /** Sidereal solar longitude (0–360°) at UTC instant; matches chart engine / ayanamsa choice. */
+  sunSiderealLongitudeUtc(dateUtc: Date, ayanamsaMode?: string): number {
+    if (process.env.CHART_ENGINE === 'legacy') {
+      const ayanamsa = this.computeAyanamsa(dateUtc, ayanamsaMode);
+      return this.computeSiderealLongitudes(dateUtc, ayanamsa).sun;
+    }
+    try {
+      const sidMode =
+        ayanamsaMode === 'krishnamurti' ? SiderealMode.Krishnamurti : SiderealMode.Lahiri;
+      setSiderealMode(sidMode);
+      setTopocentric(0, 0, 0);
+      const jd = dateToJulianDay(dateUtc);
+      const flags =
+        CalculationFlag.SwissEphemeris | CalculationFlag.Speed | CalculationFlag.Sidereal;
+      return this.normalize(calculatePosition(jd, Planet.Sun, flags).longitude);
+    } catch {
+      const ayanamsa = this.computeAyanamsa(dateUtc, ayanamsaMode);
+      return this.computeSiderealLongitudes(dateUtc, ayanamsa).sun;
+    }
+  }
+
+  /** Whole nakṣatra name from sidereal Moon longitude (same 27-fold as birth chart). */
+  nakshatraNameFromMoonLongitude(moonLongitude: number): string {
+    return this.getNakshatra(moonLongitude);
+  }
+
   private moonSiderealLongitudeLegacy(dateUtc: Date, ayanamsaMode?: string): number {
     const d = this.daysSinceJ2000(dateUtc);
     const tropical = this.moonLongitudeTropicalRefined(d);
@@ -234,7 +261,7 @@ export class ChartService implements OnModuleDestroy {
     const dasha = this.computeMahadasha(birthDate, longitudes.moon);
     const planetStrength = this.computePlanetStrength(longitudes);
 
-    return {
+    const base = {
       lagna,
       nakshatra,
       planetaryData: this.toPlanetarySignMap(longitudes),
@@ -260,6 +287,7 @@ export class ChartService implements OnModuleDestroy {
         birthTimeResolution: birthMoment.resolution,
       },
     };
+    return this.applyOptionalLagnaUserOverride(base, dto.lagnaUserOverride, longitudes);
   }
 
   private generateLegacy(
@@ -289,7 +317,7 @@ export class ChartService implements OnModuleDestroy {
     const dasha = this.computeMahadasha(birthDate, longitudes.moon);
     const planetStrength = this.computePlanetStrength(longitudes);
 
-    return {
+    const base = {
       lagna,
       nakshatra,
       planetaryData: this.toPlanetarySignMap(longitudes),
@@ -310,6 +338,62 @@ export class ChartService implements OnModuleDestroy {
         ephemeris: 'legacy-mean-orbit',
         birthTimeZone: birthMoment.zoneUsed,
         birthTimeResolution: birthMoment.resolution,
+      },
+    };
+    return this.applyOptionalLagnaUserOverride(base, dto.lagnaUserOverride, longitudes);
+  }
+
+  /**
+   * When the user confirms a different whole-sign rising, rotate sidereal ascendant longitude by N×30°
+   * and recompute whole-sign houses + planet house numbers (planet longitudes unchanged).
+   */
+  private applyOptionalLagnaUserOverride(
+    base: {
+      lagna: string;
+      nakshatra: string;
+      planetaryData: PlanetaryData;
+      chartData: Record<string, unknown>;
+    },
+    overrideRaw: string | undefined,
+    longitudes: PlanetLongitudes,
+  ): {
+    lagna: string;
+    nakshatra: string;
+    planetaryData: PlanetaryData;
+    chartData: Record<string, unknown>;
+  } {
+    const raw = overrideRaw?.trim();
+    if (!raw) return base;
+    if (!SIDEREAL_SIGNS.includes(raw as (typeof SIDEREAL_SIGNS)[number])) return base;
+    const canon = raw as (typeof SIDEREAL_SIGNS)[number];
+    const curr = base.lagna.trim();
+    if (!SIDEREAL_SIGNS.includes(curr as (typeof SIDEREAL_SIGNS)[number])) return base;
+    const currSign = curr as (typeof SIDEREAL_SIGNS)[number];
+    if (currSign === canon) return base;
+    const ascRaw = base.chartData['ascendantLongitude'];
+    const ascLon = typeof ascRaw === 'number' ? ascRaw : Number(ascRaw);
+    if (!Number.isFinite(ascLon)) return base;
+    const currIdx = SIDEREAL_SIGNS.indexOf(currSign);
+    const targetIdx = SIDEREAL_SIGNS.indexOf(canon);
+    const shift = (targetIdx - currIdx + 12) % 12;
+    const newAsc = this.normalize(ascLon + shift * 30);
+    const houses = this.computeHouses(newAsc);
+    const planetHouses = this.computePlanetHouses(longitudes, newAsc);
+    const lagna = this.getSignName(newAsc);
+    const decimals = (base.chartData['ephemeris'] as string | undefined)?.includes('swiss') ? 6 : 4;
+    const roundAsc = Number(newAsc.toFixed(decimals));
+    return {
+      lagna,
+      nakshatra: base.nakshatra,
+      planetaryData: base.planetaryData,
+      chartData: {
+        ...base.chartData,
+        lagna,
+        ascendantLongitude: roundAsc,
+        houses,
+        planetHouses,
+        lagnaUserOverride: canon,
+        computedLagna: base.lagna,
       },
     };
   }

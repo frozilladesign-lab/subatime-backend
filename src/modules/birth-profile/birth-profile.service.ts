@@ -3,12 +3,15 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { DateTime } from 'luxon';
 import { PrismaService } from '../../database/prisma.service';
 import { okResponse } from '../../common/utils/response.util';
 import { find as geoTzFind } from 'geo-tz';
 import { UpsertBirthProfileAuthDto, UpsertBirthProfileDto } from './dto/birth-profile.dto';
+import { PatchBirthProfileDto } from './dto/patch-birth-profile.dto';
 import { ChartService } from '../astrology/services/chart.service';
 
 @Injectable()
@@ -112,6 +115,47 @@ export class BirthProfileService {
     return okResponse(profile, 'Birth profile saved');
   }
 
+  async suggestPlaces(_userId: string, query: string) {
+    const q = query.trim();
+    if (q.length < 2) {
+      return okResponse({ items: [] as unknown[] }, 'Places suggestions');
+    }
+    if (q.length > 200) {
+      throw new BadRequestException('Search text is too long.');
+    }
+
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5&addressdetails=0`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: {
+          'User-Agent': 'SubatimeBackend/1.0 (birth-profile places)',
+          Accept: 'application/json',
+        },
+      });
+    } catch (e) {
+      this.logger.warn(`Places suggest fetch failed: ${String(e)}`);
+      throw new ServiceUnavailableException('Location search is temporarily unavailable.');
+    }
+    if (!res.ok) {
+      throw new ServiceUnavailableException('Location search is temporarily unavailable.');
+    }
+    const rows = (await res.json()) as { display_name?: string; lat?: string; lon?: string }[];
+    if (!Array.isArray(rows)) {
+      return okResponse({ items: [] }, 'Places suggestions');
+    }
+    const items = rows
+      .map((r) => {
+        const label = typeof r.display_name === 'string' ? r.display_name.trim() : '';
+        const lat = Number(r.lat);
+        const lon = Number(r.lon);
+        if (!label || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+        return { label, lat, lon };
+      })
+      .filter((x): x is { label: string; lat: number; lon: number } => x != null);
+    return okResponse({ items }, 'Places suggestions');
+  }
+
   async upsertForAuthedUser(userId: string, dto: UpsertBirthProfileAuthDto) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
@@ -151,11 +195,20 @@ export class BirthProfileService {
       }
     }
 
+    const explicitTz = dto.timezone?.trim();
     const tzResolved = this.resolveTimezone(lat, lon);
     const tz =
-      tzResolved ??
-      (dto.timezone?.trim() ? dto.timezone.trim() : null);
-    const timezoneSource = tzResolved ? 'geo-tz' : dto.timezone?.trim() ? 'user-input' : 'legacy-unknown';
+      explicitTz && this.isValidIanaZone(explicitTz)
+        ? explicitTz
+        : (tzResolved ?? (explicitTz ?? null));
+    const timezoneSource =
+      explicitTz && this.isValidIanaZone(explicitTz)
+        ? 'user-input'
+        : tzResolved
+          ? 'geo-tz'
+          : explicitTz
+            ? 'user-input'
+            : 'legacy-unknown';
     const localClock = this.normalizeClock(dto.timeOfBirth);
     const dateOfBirth = new Date(`${dto.dateOfBirth}T00:00:00.000Z`);
     const timeOfBirth = this.composeBirthInstant(
@@ -178,6 +231,15 @@ export class BirthProfileService {
       });
     }
 
+    if (dto.gender?.trim()) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { gender: dto.gender.trim() },
+      });
+    }
+
+    const lagnaStored = dto.userKnownLagna?.trim() ? dto.userKnownLagna.trim() : null;
+
     const profile = await this.prisma.birthProfile.upsert({
       where: { userId },
       update: {
@@ -196,6 +258,7 @@ export class BirthProfileService {
         timezoneOffsetMinutes,
         migrationSource: null,
         predictionTier: dto.predictionTier ?? undefined,
+        ...(dto.userKnownLagna !== undefined ? { userKnownLagna: lagnaStored } : {}),
       },
       create: {
         userId,
@@ -214,8 +277,12 @@ export class BirthProfileService {
         timezoneOffsetMinutes,
         migrationSource: null,
         predictionTier: dto.predictionTier ?? null,
+        userKnownLagna: lagnaStored,
       },
     });
+
+    await this.mergeOnboardingMoods(userId, dto.onboardingMoods);
+
     await this.refreshChartSnapshot(userId, profile.id, {
       fullName:
         normalizedName && normalizedName.length >= 2
@@ -227,19 +294,82 @@ export class BirthProfileService {
       latitude: lat,
       longitude: lon,
       timezone: tz ?? 'UTC',
+      lagnaUserOverride: profile.userKnownLagna ?? undefined,
     });
 
-    return okResponse(profile, 'Birth profile saved');
+    const refreshed = await this.prisma.birthProfile.findUnique({ where: { userId } });
+    return okResponse(refreshed ?? profile, 'Birth profile saved');
   }
 
-  async getMine(userId: string) {
-    const profile = await this.prisma.birthProfile.findUnique({
-      where: { userId },
-    });
+  async patchMine(userId: string, dto: PatchBirthProfileDto) {
+    const profile = await this.prisma.birthProfile.findUnique({ where: { userId } });
     if (!profile) {
       throw new NotFoundException('Birth profile not found');
     }
-    return okResponse(profile, 'Birth profile fetched');
+
+    if (dto.gender?.trim()) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { gender: dto.gender.trim() },
+      });
+    }
+
+    await this.mergeOnboardingMoods(userId, dto.onboardingMoods);
+
+    let nextProfile = profile;
+    const lagnaPatchProvided = dto.userKnownLagna !== undefined;
+    if (lagnaPatchProvided) {
+      const t = dto.userKnownLagna?.trim() ?? '';
+      const stored = t.length ? t : null;
+      nextProfile = await this.prisma.birthProfile.update({
+        where: { userId },
+        data: { userKnownLagna: stored },
+      });
+    }
+
+    if (lagnaPatchProvided) {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { email: true, name: true },
+      });
+      const birthDate =
+        nextProfile.birthLocalDate ?? nextProfile.dateOfBirth.toISOString().slice(0, 10);
+      const localClock =
+        nextProfile.birthLocalTime ??
+        DateTime.fromJSDate(nextProfile.timeOfBirth, { zone: 'UTC' }).toFormat('HH:mm');
+
+      await this.refreshChartSnapshot(userId, nextProfile.id, {
+        fullName: user?.name?.trim() || user?.email?.split('@')[0] || 'User',
+        birthDate,
+        birthTime: localClock,
+        birthPlace: nextProfile.placeOfBirth,
+        latitude: nextProfile.latitude,
+        longitude: nextProfile.longitude,
+        timezone: nextProfile.timezone ?? 'UTC',
+        lagnaUserOverride: nextProfile.userKnownLagna ?? undefined,
+      });
+    }
+
+    const out = await this.prisma.birthProfile.findUnique({ where: { userId } });
+    return okResponse(out ?? nextProfile, 'Birth profile updated');
+  }
+
+  async getMine(userId: string) {
+    const [profile, user] = await Promise.all([
+      this.prisma.birthProfile.findUnique({ where: { userId } }),
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { gender: true, preferences: true },
+      }),
+    ]);
+    if (!profile) {
+      throw new NotFoundException('Birth profile not found');
+    }
+    const onboardingMoods = this.readOnboardingMoods(user?.preferences);
+    return okResponse(
+      { ...profile, gender: user?.gender ?? null, onboardingMoods },
+      'Birth profile fetched',
+    );
   }
 
   async getAuditSnapshot(userId: string) {
@@ -267,6 +397,7 @@ export class BirthProfileService {
       longitude: profile.longitude,
       timezone,
       ayanamsa: 'lahiri',
+      lagnaUserOverride: profile.userKnownLagna ?? undefined,
     });
     const chart = (generated.chartData ?? {}) as Record<string, unknown>;
     const planetMap = (generated.planetaryData ?? {}) as Record<string, unknown>;
@@ -315,9 +446,51 @@ export class BirthProfileService {
     );
   }
 
+  private isValidIanaZone(zone: string): boolean {
+    const z = zone.trim();
+    if (!z) return false;
+    const dt = DateTime.now().setZone(z);
+    return dt.isValid;
+  }
+
+  private readOnboardingMoods(raw: unknown): string[] {
+    if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return [];
+    const m = (raw as Record<string, unknown>).onboardingMoods;
+    if (!Array.isArray(m)) return [];
+    return m.map((x) => String(x).trim()).filter(Boolean);
+  }
+
+  private async mergeOnboardingMoods(userId: string, moods?: string[] | null): Promise<void> {
+    if (!moods?.length) return;
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { preferences: true },
+    });
+    const baseRaw = user?.preferences;
+    const base =
+      baseRaw != null && typeof baseRaw === 'object' && !Array.isArray(baseRaw)
+        ? { ...(baseRaw as Record<string, unknown>) }
+        : {};
+    const prev = base.onboardingMoods;
+    const prevList = Array.isArray(prev) ? prev.map((x) => String(x).trim()).filter(Boolean) : [];
+    const next = [...new Set([...prevList, ...moods.map((m) => m.trim()).filter(Boolean)])];
+    base.onboardingMoods = next;
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { preferences: base as Prisma.InputJsonValue },
+    });
+  }
+
   private normalizeIntent(raw?: string): string | null {
-    const t = raw?.trim();
-    return t ? t : null;
+    const allowed = new Set(['love', 'career', 'growth', 'dreams']);
+    const parts = (raw ?? '')
+      .split(/[,]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => allowed.has(s));
+    const uniq = [...new Set(parts)];
+    if (!uniq.length) return null;
+    uniq.sort();
+    return uniq.join(',');
   }
 
   private resolveTimezone(lat: number, lon: number): string | null {
@@ -406,6 +579,7 @@ export class BirthProfileService {
       latitude: number;
       longitude: number;
       timezone: string;
+      lagnaUserOverride?: string;
     },
   ): Promise<void> {
     try {
@@ -418,6 +592,7 @@ export class BirthProfileService {
         longitude: input.longitude,
         timezone: input.timezone,
         ayanamsa: 'lahiri',
+        lagnaUserOverride: input.lagnaUserOverride,
       });
       const latest = await this.prisma.astrologyChart.findFirst({
         where: { birthProfileId },

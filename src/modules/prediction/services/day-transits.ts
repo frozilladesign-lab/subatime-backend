@@ -114,13 +114,16 @@ function hashSeed(parts: string[]): number {
 }
 
 function rankPool(intent: string | null | undefined): PoolEntry[] {
-  const key = (intent ?? '').toLowerCase().trim();
-  if (!key) return [...POOL];
-  return [...POOL].sort((a, b) => {
-    const ma = a.intents?.includes(key) ? 1 : 0;
-    const mb = b.intents?.includes(key) ? 1 : 0;
-    return mb - ma;
-  });
+  const raw = (intent ?? '').toLowerCase().trim();
+  if (!raw) return [...POOL];
+  const keys = raw
+    .split(/[,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!keys.length) return [...POOL];
+  const score = (entry: PoolEntry) =>
+    keys.reduce((acc, key) => acc + (entry.intents?.includes(key) ? 1 : 0), 0);
+  return [...POOL].sort((a, b) => score(b) - score(a));
 }
 
 /**

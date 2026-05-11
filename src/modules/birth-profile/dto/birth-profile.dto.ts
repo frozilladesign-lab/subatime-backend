@@ -1,5 +1,7 @@
 import {
+  IsArray,
   IsEmail,
+  IsIn,
   IsNumber,
   IsOptional,
   IsString,
@@ -7,6 +9,21 @@ import {
   MaxLength,
   MinLength,
 } from 'class-validator';
+
+const LAGNA_SIGNS = [
+  'Mesha',
+  'Vrishabha',
+  'Mithuna',
+  'Karka',
+  'Simha',
+  'Kanya',
+  'Tula',
+  'Vrischika',
+  'Dhanu',
+  'Makara',
+  'Kumbha',
+  'Meena',
+] as const;
 
 /** Legacy body shape — retained only for scripts/tests; prefer authenticated `/birth-profile`. */
 export class UpsertBirthProfileDto {
@@ -101,4 +118,19 @@ export class UpsertBirthProfileAuthDto {
   @MinLength(2)
   @MaxLength(80)
   fullName?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  onboardingMoods?: string[];
+
+  @IsOptional()
+  @IsString()
+  @IsIn(['male', 'female', 'non_binary', 'unspecified'])
+  gender?: string;
+
+  @IsOptional()
+  @IsString()
+  @IsIn(LAGNA_SIGNS as unknown as string[])
+  userKnownLagna?: string;
 }

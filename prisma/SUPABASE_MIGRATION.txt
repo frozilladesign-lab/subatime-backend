@@ -1,0 +1,13 @@
+Supabase + Prisma migrations
+-----------------------------
+1) Normal:     npm run prisma:migrate:deploy
+
+2) EMAXCONNSESSION on session pool (:5432):
+   Session slots (15) are full. Use the transaction pool instead:
+     npm run prisma:migrate:apply-transaction
+   (Applies pending prisma/migrations/*.sql via DATABASE_URL :6543 + records _prisma_migrations.)
+
+3) P1001 to db.<project>.supabase.co:
+   Often IPv6-only from your network. Prefer pooler hosts from Dashboard → Connect → Prisma.
+
+4) If `migrate deploy` on :6543 hangs: use (2) for new migrations, or free session connections and retry (1).

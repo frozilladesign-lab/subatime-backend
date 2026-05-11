@@ -67,8 +67,8 @@ export class UserService {
   }
 
   async patchPreferences(userId: string, dto: PatchUserPreferencesDto) {
-    if (dto.adaptation == null) {
-      throw new BadRequestException('Provide at least one preferences key (e.g. adaptation).');
+    if (dto.adaptation == null && dto.notifications == null) {
+      throw new BadRequestException('Provide at least one preferences key (e.g. adaptation or notifications).');
     }
 
     const row = await this.prisma.user.findUnique({
@@ -77,15 +77,31 @@ export class UserService {
     });
 
     const root = this.parseJsonObject(row?.preferences);
-    const storedAdapt = this.parseJsonObject(root.adaptation);
-    const nextAdapt: Record<string, unknown> = { ...storedAdapt };
-    const a = dto.adaptation;
-    if (a.depth !== undefined) nextAdapt.depth = Math.round(Number(a.depth));
-    if (a.sensitivity !== undefined) nextAdapt.sensitivity = Math.round(Number(a.sensitivity));
-    if (a.dreamDepth !== undefined) nextAdapt.dreamDepth = Math.round(Number(a.dreamDepth));
-    if (a.strictness !== undefined) nextAdapt.strictness = Math.round(Number(a.strictness));
+    let next: Record<string, unknown> = { ...root };
 
-    const next: Record<string, unknown> = { ...root, adaptation: nextAdapt };
+    if (dto.adaptation != null) {
+      const storedAdapt = this.parseJsonObject(root.adaptation);
+      const nextAdapt: Record<string, unknown> = { ...storedAdapt };
+      const a = dto.adaptation;
+      if (a.depth !== undefined) nextAdapt.depth = Math.round(Number(a.depth));
+      if (a.sensitivity !== undefined) nextAdapt.sensitivity = Math.round(Number(a.sensitivity));
+      if (a.dreamDepth !== undefined) nextAdapt.dreamDepth = Math.round(Number(a.dreamDepth));
+      if (a.strictness !== undefined) nextAdapt.strictness = Math.round(Number(a.strictness));
+      next = { ...next, adaptation: nextAdapt };
+    }
+
+    if (dto.notifications != null) {
+      const storedNotif = this.parseJsonObject(root.notifications);
+      const nextNotif: Record<string, unknown> = { ...storedNotif };
+      const n = dto.notifications;
+      if (n.muteLearningTips !== undefined) {
+        nextNotif.muteLearningTips = Boolean(n.muteLearningTips);
+      }
+      if (n.proactiveHoraAlerts !== undefined) {
+        nextNotif.proactiveHoraAlerts = Boolean(n.proactiveHoraAlerts);
+      }
+      next = { ...next, notifications: nextNotif };
+    }
 
     await this.prisma.user.update({
       where: { id: userId },
@@ -111,6 +127,10 @@ export class UserService {
       dreamDepth: number;
       strictness: number;
     };
+    notifications: {
+      muteLearningTips: boolean;
+      proactiveHoraAlerts: boolean;
+    };
   } {
     const defaults = {
       depth: 75,
@@ -125,17 +145,30 @@ export class UserService {
       adaptRaw != null && typeof adaptRaw === 'object' && !Array.isArray(adaptRaw)
         ? (adaptRaw as Record<string, unknown>)
         : {};
+    const notifRaw = root.notifications;
+    const notif =
+      notifRaw != null && typeof notifRaw === 'object' && !Array.isArray(notifRaw)
+        ? (notifRaw as Record<string, unknown>)
+        : {};
     const num = (v: unknown, fallback: number): number => {
       const n = typeof v === 'number' ? v : Number(v);
       if (!Number.isFinite(n)) return fallback;
       return Math.min(100, Math.max(0, Math.round(n)));
     };
+    const muteRaw = notif.muteLearningTips;
+    const muteLearningTips = muteRaw === true || muteRaw === 'true';
+    const proactiveRaw = notif.proactiveHoraAlerts;
+    const proactiveHoraAlerts = proactiveRaw === false || proactiveRaw === 'false' ? false : true;
     return {
       adaptation: {
         depth: num(adapt.depth, defaults.depth),
         sensitivity: num(adapt.sensitivity, defaults.sensitivity),
         dreamDepth: num(adapt.dreamDepth, defaults.dreamDepth),
         strictness: num(adapt.strictness, defaults.strictness),
+      },
+      notifications: {
+        muteLearningTips,
+        proactiveHoraAlerts,
       },
     };
   }

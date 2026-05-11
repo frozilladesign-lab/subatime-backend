@@ -3,6 +3,30 @@ import { existsSync, readFileSync } from 'fs';
 import * as admin from 'firebase-admin';
 import type { ServiceAccount } from 'firebase-admin';
 
+/**
+ * FCM `data` map for Subha / Abhijit-style alerts (progressive disclosure).
+ * Keep values short strings; the client shows `notification.title/body` on the lock screen
+ * and only surfaces `reasonTitle`, `reasonDetails`, directions, etc. after tap.
+ * Android requires string values in `data`.
+ */
+export function buildSubhaTimePushData(params: {
+  timeBlock: string;
+  reasonTitle: string;
+  reasonDetails: string;
+  maruDirection: string;
+  subhaDishawa: string;
+}): Record<string, string> {
+  return {
+    click_action: 'FLUTTER_NOTIFICATION_CLICK',
+    alertType: 'SUBHA_TIME',
+    timeBlock: params.timeBlock,
+    reasonTitle: params.reasonTitle,
+    reasonDetails: params.reasonDetails,
+    maruDirection: params.maruDirection,
+    subhaDishawa: params.subhaDishawa,
+  };
+}
+
 /** FCM error codes that mean the token row should be deleted. */
 export function isUnregisteredFcmError(code: string | undefined): boolean {
   if (!code) return false;
@@ -50,6 +74,7 @@ export class FirebasePushService implements OnModuleInit {
 
   /**
    * Sends one notification per token (same title/body/data). Uses `sendEach` (up to 500 per HTTP request internally).
+   * Use a short `notification` for the tray; put astrology copy in `data` (see [buildSubhaTimePushData]).
    */
   async sendEachToTokens(params: {
     tokens: string[];

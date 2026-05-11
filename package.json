@@ -13,6 +13,8 @@
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
     "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "prisma:migrate:apply-transaction": "node scripts/apply-pending-migrations.cjs",
     "prisma:seed": "prisma db seed"
   },
   "dependencies": {

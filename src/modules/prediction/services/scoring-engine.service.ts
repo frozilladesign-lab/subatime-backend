@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { taraIndex1to9, taraScoreFromIndex1to9 } from '../../astrology/jyotisha-tara';
 import { ChartService, NAKSHATRA_LIST } from '../../astrology/services/chart.service';
 import {
   deriveDailyTransitsFromPool,
@@ -67,10 +68,21 @@ export class ScoringEngineService {
       const transitMoon = this.chartService.moonSiderealLongitudeUtc(tMid, ayanamsaMode);
       const transitNakIdx = Math.floor(this.norm360(transitMoon) / (360 / 27));
 
-      const moonHouse = snap
+      const moonHouseLagna = snap
         ? this.wholeSignHouse(transitMoon, snap.ascendantLongitude)
         : this.fallbackHouseFromLagna(input.lagna, idx);
-      const moonTransitN = this.normalizeMoonHouseScore(moonHouse);
+      /** Janma Rāśi (Chandra lagna): whole-sign house from natal Moon — weights Sri Lankan Gochara emphasis. */
+      const moonHouseChandra = snap
+        ? this.wholeSignHouse(transitMoon, snap.natalMoonSid)
+        : moonHouseLagna;
+      const moonTransitN = snap
+        ? Number(
+            (
+              0.55 * this.normalizeMoonHouseScore(moonHouseChandra) +
+              0.45 * this.normalizeMoonHouseScore(moonHouseLagna)
+            ).toFixed(4),
+          )
+        : this.normalizeMoonHouseScore(moonHouseLagna);
 
       const nakTaraN = this.nakshatraTaraScore(transitNakIdx, natalNakIdx);
       const aspectN = snap
@@ -213,13 +225,11 @@ export class ScoringEngineService {
   }
 
   /**
-   * Distance between birth star and transit Moon star (27-fold), then tiered score.
+   * Tara Bāla from birth nakṣatra to transiting Moon nakṣatra (nine-fold), mapped to 0–1 for scoring.
    */
   private nakshatraTaraScore(transitIdx: number, natalIdx: number): number {
-    const d = (transitIdx - natalIdx + 27) % 27;
-    if ([0, 2, 4, 6].includes(d)) return 1;
-    if ([1, 3, 5].includes(d)) return 0.72;
-    return 0.28;
+    const ti = taraIndex1to9(natalIdx, transitIdx);
+    return taraScoreFromIndex1to9(ti);
   }
 
   private gauss(delta: number, target: number, orb: number): number {
