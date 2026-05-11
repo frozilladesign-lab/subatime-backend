@@ -1,0 +1,337 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Language {
+  si
+  en
+}
+
+enum FeedbackType {
+  good
+  bad
+}
+
+enum NotificationType {
+  daily
+  daily_evening
+  daily_night
+  warning
+  event
+}
+
+enum NotificationStatus {
+  pending
+  sent
+  failed
+}
+
+enum AiExplanationType {
+  chat
+  report
+  match
+}
+
+enum ReportType {
+  daily
+  match
+  full
+}
+
+enum ReportGenerator {
+  ai
+  system
+}
+
+enum DevicePlatform {
+  android
+  ios
+}
+
+enum WellnessSnapshotSource {
+  personalize_submit
+  nightly_checkin
+}
+
+model User {
+  id                 String               @id @default(uuid()) @db.Uuid
+  name               String
+  email              String               @unique
+  passwordHash       String?
+  language           Language             @default(si)
+  accuracyScore      Float                @default(0.5)
+  /// Client-owned JSON (e.g. `{ "adaptation": { "depth", "sensitivity", "dreamDepth", "strictness" } }`). Merged via PATCH.
+  preferences        Json                 @default("{}")
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+  birthProfile       BirthProfile?
+  dailyPredictions   DailyPrediction[]
+  predictionFeedback PredictionFeedback[]
+  notificationJobs   NotificationJob[]
+  deviceTokens       UserDeviceToken[]
+  matchResultsAsA    MatchResult[]        @relation("MatchUserA")
+  matchResultsAsB    MatchResult[]        @relation("MatchUserB")
+  aiExplanations     AiExplanation[]
+  reports            Report[]
+  compatibilityProfiles CompatibilityProfile[]
+  dreamEntries       DreamEntry[]
+  wellnessSnapshots  WellnessSnapshot[]
+
+  @@map("users")
+}
+
+model WellnessSnapshot {
+  id            String                 @id @default(uuid()) @db.Uuid
+  userId        String                 @db.Uuid
+  recordedAt    DateTime               @default(now())
+  /// UTC calendar date this snapshot ties to (e.g. the plan day), not inferred from recordedAt alone.
+  planDate      DateTime?              @db.Date
+  sleepQuality  Int
+  stressLevel   Int
+  fatigueLevel  Int
+  source        WellnessSnapshotSource
+  user          User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, recordedAt(sort: Desc)])
+  @@index([userId, planDate])
+  @@map("wellness_snapshots")
+}
+
+model CompatibilityProfile {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @db.Uuid
+  fullName      String
+  gender        String
+  dateOfBirth   DateTime
+  zodiacSign    String
+  birthLocation String
+  timeOfBirth   String
+  purpose       String?
+  /// Last compare `overall` (0–100) when client saved after a successful match.
+  compatibilityScore Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("compatibility_profiles")
+}
+
+model DreamEntry {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  title     String
+  body      String   @db.Text
+  mood      String
+  /// Structured extraction + deterministic scores (Gemini tags only; DS computed in code).
+  analysis  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("dream_entries")
+}
+
+model BirthProfile {
+  id           String          @id @default(uuid()) @db.Uuid
+  userId       String          @unique @db.Uuid
+  /// Original local calendar date entered by user, kept immutable-friendly for audits.
+  birthLocalDate String?
+  /// Original local clock time entered by user, canonical HH:mm.
+  birthLocalTime String?
+  /// Canonical UTC instant derived from local date/time + timezone.
+  birthUtcTime   DateTime?
+  dateOfBirth  DateTime
+  timeOfBirth  DateTime
+  placeOfBirth String
+  latitude     Float
+  longitude    Float
+  lagna        String?
+  nakshatra    String?
+  /// UX-only onboarding preference (love/career/growth/dreams); biases prediction personalization.
+  onboardingIntent String?
+  /// exact | approx | unknown — how birth time was captured.
+  birthTimeAccuracy String?
+  /// IANA timezone id resolved from birthplace coordinates when possible.
+  timezone         String?
+  /// Where timezone came from (geo-tz | user-input | legacy-unknown).
+  timezoneSource   String?
+  /// Historical offset used for conversion, in minutes (e.g. +390 for Asia/Colombo in 1997).
+  timezoneOffsetMinutes Int?
+  /// Legacy backfill marker (e.g. legacy_utc_only) when deterministic local source is unavailable.
+  migrationSource  String?
+  /// quick | accurate | veryAccurate — onboarding expectation tier.
+  predictionTier   String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  user         User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  charts       AstrologyChart[]
+
+  @@map("birth_profiles")
+}
+
+model AstrologyChart {
+  id             String       @id @default(uuid()) @db.Uuid
+  birthProfileId String       @db.Uuid
+  version        Int          @default(1)
+  chartData      Json
+  planetaryData  Json
+  createdAt      DateTime     @default(now())
+  birthProfile   BirthProfile @relation(fields: [birthProfileId], references: [id], onDelete: Cascade)
+
+  @@index([birthProfileId])
+  @@unique([birthProfileId, version])
+  @@map("astrology_charts")
+}
+
+model DailyPrediction {
+  id              String               @id @default(uuid()) @db.Uuid
+  userId          String               @db.Uuid
+  date            DateTime             @db.Date
+  summary         String               @db.Text
+  goodTimes       Json
+  badTimes        Json
+  /// Structured transit highlights for explainable Day Plan UI (JSON array).
+  transits        Json?
+  confidenceScore Float
+  /// Spread between best and worst scored windows; used for calendar rating without recomputing scores.
+  scoreSpread     Float                @default(0.35)
+  /// Same as personalization.mostRelevantContext at generation time (overall | career | love | health).
+  dominantContext String               @default("overall")
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  user            User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  feedback        PredictionFeedback[]
+
+  @@unique([userId, date])
+  @@index([userId, date])
+  @@map("daily_predictions")
+}
+
+model PredictionFeedback {
+  id            String         @id @default(uuid()) @db.Uuid
+  predictionId  String         @db.Uuid
+  userId        String         @db.Uuid
+  feedback      FeedbackType
+  actualOutcome String?
+  contextType   String?
+  timeSlot      String?
+  timestamp     DateTime       @default(now())
+  prediction    DailyPrediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([predictionId])
+  @@index([userId, timestamp])
+  @@map("prediction_feedback")
+}
+
+model NotificationJob {
+  id               String              @id @default(uuid()) @db.Uuid
+  userId           String              @db.Uuid
+  type             NotificationType
+  payload          Json
+  scheduledAt      DateTime
+  status           NotificationStatus  @default(pending)
+  /// In-app read state (push delivery uses NotificationLog separately).
+  isRead           Boolean             @default(false)
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  user             User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  notificationLogs NotificationLog[]
+
+  @@index([userId, scheduledAt])
+  @@index([status, scheduledAt])
+  @@unique([userId, type, scheduledAt])
+  @@map("notification_jobs")
+}
+
+model NotificationLog {
+  id             String          @id @default(uuid()) @db.Uuid
+  jobId           String          @db.Uuid
+  sentAt          DateTime        @default(now())
+  deliveryStatus  String
+  notificationJob NotificationJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId, sentAt])
+  @@map("notification_logs")
+}
+
+model MatchResult {
+  id         String   @id @default(uuid()) @db.Uuid
+  userAId    String   @db.Uuid
+  userBId    String   @db.Uuid
+  score      Float
+  breakdown  Json
+  aiInsight  String?  @db.Text
+  createdAt  DateTime @default(now())
+  userA      User     @relation("MatchUserA", fields: [userAId], references: [id], onDelete: Cascade)
+  userB      User     @relation("MatchUserB", fields: [userBId], references: [id], onDelete: Cascade)
+
+  @@index([userAId, createdAt])
+  @@index([userBId, createdAt])
+  @@map("match_results")
+}
+
+model AiExplanation {
+  id        String            @id @default(uuid()) @db.Uuid
+  userId    String            @db.Uuid
+  type      AiExplanationType
+  input     Json
+  output    String            @db.Text
+  createdAt DateTime          @default(now())
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type, createdAt])
+  @@map("ai_explanations")
+}
+
+model Report {
+  id          String         @id @default(uuid()) @db.Uuid
+  userId      String         @db.Uuid
+  type        ReportType
+  fileUrl     String
+  generatedBy ReportGenerator
+  createdAt   DateTime       @default(now())
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type, createdAt])
+  @@map("reports")
+}
+
+model UserDeviceToken {
+  id        String         @id @default(uuid()) @db.Uuid
+  userId    String         @db.Uuid
+  token     String         @unique
+  platform  DevicePlatform
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("user_device_tokens")
+}
+
+/// Read-through cache for Gemini Sinhala (and future) translations — keyed by SHA-256 of canonical English JSON.
+model AiTranslationCache {
+  id          String   @id @default(uuid()) @db.Uuid
+  /// SHA-256 hex (64 chars) of `{ operation, model, body }`.
+  cacheKey    String   @unique @db.VarChar(64)
+  operation   String   @db.VarChar(64)
+  geminiModel String   @db.VarChar(128)
+  sourceLang  String   @default("en") @db.VarChar(8)
+  targetLang  String   @default("si") @db.VarChar(8)
+  resultJson  Json
+  expiresAt   DateTime
+  hitCount    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([operation, expiresAt])
+  @@map("ai_translation_cache")
+}
