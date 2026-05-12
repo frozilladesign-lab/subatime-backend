@@ -47,7 +47,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       getVercelExpressApp: () => Promise<Application>;
     };
     const app = await getVercelExpressApp();
-    app(req as Request, res as Response);
+    // Vercel's IncomingMessage/ServerResponse are structurally compatible with Express; cast for TS.
+    app(req as unknown as Request, res as unknown as Response);
   } catch (err) {
     console.error('[api/index] bootstrap failed', err);
     if (!res.headersSent) {
