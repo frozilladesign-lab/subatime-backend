@@ -25,7 +25,7 @@
     <p>
       HTTP routes are served under <code>/api</code> (Nest global prefix). This page is generated at build time so
       Vercel’s output directory check succeeds; the API is handled by the serverless function in
-      <code>api/[...path].ts</code>.
+      <code>api/index.ts</code> (rewrites send all <code>/api/*</code> here).
     </p>
   </body>
 </html>

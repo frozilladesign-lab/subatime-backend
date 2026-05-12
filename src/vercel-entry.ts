@@ -8,7 +8,7 @@ import { applyHttpLayer } from './http-app';
 let cached: express.Express | undefined;
 
 /**
- * Express instance for Vercel serverless (`api/[...path].ts`).
+ * Express instance for Vercel serverless (`api/index.ts` + rewrites to `/api`).
  * Cached across invocations to reduce cold-start cost.
  */
 export async function getVercelExpressApp(): Promise<express.Express> {

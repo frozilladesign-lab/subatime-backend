@@ -4,11 +4,11 @@
   "buildCommand": "npm run build",
   "outputDirectory": "public",
   "rewrites": [
-    { "source": "/api", "destination": "/api/health" },
-    { "source": "/api/", "destination": "/api/health" }
+    { "source": "/api/(.*)", "destination": "/api" },
+    { "source": "/api", "destination": "/api" }
   ],
   "functions": {
-    "api/[...path].ts": {
+    "api/index.ts": {
       "includeFiles": "{dist/**,prisma/schema.prisma,node_modules/@prisma/client/**,node_modules/.prisma/client/**,node_modules/@swisseph/node/**}",
       "maxDuration": 60
     }
