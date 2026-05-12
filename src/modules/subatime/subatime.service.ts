@@ -160,8 +160,9 @@ export class SubatimeService {
       const chunk = missingDates.slice(i, i + concurrency);
       await Promise.all(
         chunk.map(async (date) => {
+          // Match `/plan/day` quality (Gemini polish when configured); month slots stay consistent with list/detail.
           const prediction = await this.dailyPredictionService.generateForUser(userId, date, {
-            polishSummary: false,
+            polishSummary: true,
           });
           if (!prediction) return;
           byIso.set(prediction.date, {
