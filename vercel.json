@@ -9,7 +9,7 @@
   ],
   "functions": {
     "api/index.ts": {
-      "includeFiles": "{dist/**,prisma/schema.prisma,node_modules/@prisma/client/**,node_modules/.prisma/client/**,node_modules/@swisseph/node/**}",
+      "includeFiles": "{dist/**,prisma/schema.prisma,node_modules/@prisma/client/**,node_modules/.prisma/client/**,node_modules/@swisseph/node/**,node_modules/@swisseph/core/**,node_modules/geo-tz/**}",
       "maxDuration": 60
     }
   }
