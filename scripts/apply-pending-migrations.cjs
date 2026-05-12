@@ -1,5 +1,5 @@
 /**
- * Apply Prisma migrations using DATABASE_URL only (e.g. Supabase transaction pool :6543).
+ * Apply Prisma migrations using POSTGRES_PRISMA_URL (or legacy DATABASE_URL).
  * Use when `prisma migrate deploy` fails with EMAXCONNSESSION on session pool :5432.
  *
  * Prisma records checksum as sha256(hex) of migration.sql bytes (UTF-8, as on disk).
@@ -36,9 +36,9 @@ function checksum(sql) {
 async function main() {
   const root = path.join(__dirname, '..');
   loadEnvFile(path.join(root, '.env'));
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = process.env.POSTGRES_PRISMA_URL || process.env.DATABASE_URL;
   if (!databaseUrl) {
-    console.error('DATABASE_URL is not set.');
+    console.error('POSTGRES_PRISMA_URL (or DATABASE_URL) is not set.');
     process.exit(1);
   }
 

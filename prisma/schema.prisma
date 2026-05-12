@@ -3,9 +3,11 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  /// Supabase: transaction pooler `:6543?pgbouncer=true`. If `migrate deploy` hits session-pool limits, run `npm run prisma:migrate:apply-transaction`.
-  url = env("DATABASE_URL")
+  provider  = "postgresql"
+  /// Pooled URL (Vercel + Supabase: `POSTGRES_PRISMA_URL`, port 6543, `pgbouncer=true`).
+  url       = env("POSTGRES_PRISMA_URL")
+  /// Direct / non-pooling URL for migrations (`POSTGRES_URL_NON_POOLING` on Vercel).
+  directUrl = env("POSTGRES_URL_NON_POOLING")
 }
 
 enum Language {
