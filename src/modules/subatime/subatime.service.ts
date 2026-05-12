@@ -246,7 +246,7 @@ export class SubatimeService {
 
     const predictionRows: Array<{
       id: string;
-      type: 'good' | 'avoid' | 'quote' | 'weekly' | 'prediction';
+      type: 'good' | 'avoid' | 'quote' | 'weekly' | 'prediction' | 'charm';
       title: string;
       preview: string;
       body: string;
@@ -254,6 +254,9 @@ export class SubatimeService {
       dateLabel: string;
       source: string;
       userLagna?: string | null;
+      luckyNumber?: number;
+      luckyColor?: string;
+      luckyColorHex?: string;
     }> = [];
 
     for (const p of predictions) {
@@ -363,7 +366,14 @@ export class SubatimeService {
       });
     }
 
+    const todayIso = today.toISOString().slice(0, 10);
+    const todayPred = predictions.find((p) => p.date.toISOString().slice(0, 10) === todayIso);
+    const charmRow = todayPred
+      ? this.buildTodayCharmFeedRow(userId, todayPred, contentLang, userLagna ?? undefined)
+      : null;
+
     const feedItems = [
+      ...(charmRow ? [charmRow] : []),
       ...predictionRows,
       ...dreams.map((d) => this.buildDreamFeedRow(d, contentLang)),
     ].sort((a, b) => (a.date < b.date ? 1 : -1));
@@ -516,6 +526,10 @@ export class SubatimeService {
 
   private feedDreamSource(lang: string): string {
     return lang === 'si' ? 'සිහින දිනපොත' : 'Dream journal';
+  }
+
+  private feedCharmSource(lang: string): string {
+    return lang === 'si' ? 'දිනපතා · සුළු ආශීර්වාද' : 'Daily · Micro-charm';
   }
 
   private feedDaypartRhythmSource(lang: string): string {
@@ -956,6 +970,75 @@ export class SubatimeService {
     };
   }
 
+  /** Deterministic “lucky” anchor from user + date + prediction id (playful ritual, not fate). */
+  private luckyCharmFields(
+    userId: string,
+    dateIso: string,
+    predictionId: string,
+  ): { luckyNumber: number; luckyColor: string; luckyColorHex: string } {
+    const palette = [
+      { name: 'Emerald', hex: '#10B981' },
+      { name: 'Amber', hex: '#F59E0B' },
+      { name: 'Ocean', hex: '#0EA5E9' },
+      { name: 'Rose', hex: '#F43F5E' },
+      { name: 'Violet', hex: '#8B5CF6' },
+      { name: 'Gold', hex: '#EAB308' },
+      { name: 'Teal', hex: '#14B8A6' },
+      { name: 'Coral', hex: '#FB7185' },
+      { name: 'Sapphire', hex: '#3B82F6' },
+      { name: 'Jade', hex: '#22C55E' },
+      { name: 'Lilac', hex: '#C084FC' },
+      { name: 'Copper', hex: '#D97706' },
+    ] as const;
+    const seed = `${userId}|${dateIso}|${predictionId}`;
+    let h = 2166136261;
+    for (let i = 0; i < seed.length; i++) {
+      h ^= seed.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    const u = h >>> 0;
+    const luckyNumber = (u % 99) + 1;
+    const luckyColor = palette[u % palette.length];
+    return { luckyNumber, luckyColor: luckyColor.name, luckyColorHex: luckyColor.hex };
+  }
+
+  private buildTodayCharmFeedRow(
+    userId: string,
+    p: { id: string; date: Date; confidenceScore: number; scoreSpread: number },
+    contentLang: string,
+    userLagna?: string | null,
+  ) {
+    const dateStr = p.date.toISOString().slice(0, 10);
+    const luck = this.luckyCharmFields(userId, dateStr, p.id);
+    const dateLabel = this.relativeDayLabel(p.date, contentLang);
+    const title =
+      contentLang === 'si'
+        ? `අදේ සුළු ආශීර්වාද · ${luck.luckyNumber}`
+        : `Today’s micro-charm · ${luck.luckyNumber}`;
+    const preview =
+      contentLang === 'si'
+        ? `${luck.luckyColor} — අද ඔබේ රිද්මයට මෘදු සලකුණක්.`
+        : `${luck.luckyColor} — a soft anchor for your rhythm today.`;
+    const body =
+      contentLang === 'si'
+        ? `අංකය ${luck.luckyNumber}. වර්ණය ${luck.luckyColor}. මෙය විනෝදාත්මක සංඥාවක් පමණක්—තීරණ ඔබේමය.`
+        : `Number ${luck.luckyNumber}. Color ${luck.luckyColor}. A playful ritual anchor, not destiny—your choices stay yours.`;
+    return {
+      id: `lucky-${p.id}`,
+      type: 'charm' as const,
+      title,
+      preview,
+      body,
+      date: dateStr,
+      dateLabel,
+      source: this.feedCharmSource(contentLang),
+      luckyNumber: luck.luckyNumber,
+      luckyColor: luck.luckyColor,
+      luckyColorHex: luck.luckyColorHex,
+      ...(userLagna ? { userLagna } : {}),
+    };
+  }
+
   async getMatchProfiles(userId: string) {
     const items = await (this.prisma as any).compatibilityProfile.findMany({
       where: { userId },
@@ -1246,6 +1329,14 @@ export class SubatimeService {
         prediction.personalization.mostRelevantContext
       ] ?? 0;
     const focusPct = Math.round(contextWeight * 100);
+    const luck = this.luckyCharmFields(
+      prediction.userId,
+      prediction.date,
+      prediction.predictionId,
+    );
+    const predictionSpotlight =
+      rating === 'great' ||
+      (rating === 'good' && prediction.confidenceScore >= 0.72);
 
     return {
       predictionId: prediction.predictionId,
@@ -1275,6 +1366,12 @@ export class SubatimeService {
       cautionWindow: cautionWindow
         ? `${cautionWindow.label} (${cautionWindow.start}-${cautionWindow.end})`
         : null,
+      confidence: prediction.confidenceScore,
+      luckyNumber: luck.luckyNumber,
+      luckyColor: luck.luckyColor,
+      luckyColorHex: luck.luckyColorHex,
+      predictionSpotlight,
+      spotlightWindowLabel: bestWindow?.label?.trim() || null,
       scoreSpread: prediction.meta.scoreSpread,
       focus: prediction.personalization.mostRelevantContext,
       reasoning: {
