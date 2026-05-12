@@ -5,7 +5,7 @@
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
-    "build": "nest build && node scripts/sync-public-for-vercel.cjs",
+    "build": "prisma generate && nest build && node scripts/sync-public-for-vercel.cjs",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "lint": "eslint \"src/**/*.ts\" --fix",

@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "installCommand": "npm install && npx prisma generate",
+  "installCommand": "npm install",
   "buildCommand": "npm run build",
   "outputDirectory": "public",
   "rewrites": [
