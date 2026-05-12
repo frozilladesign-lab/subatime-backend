@@ -3,8 +3,12 @@
   "installCommand": "npm install && npx prisma generate",
   "buildCommand": "npm run build",
   "outputDirectory": "public",
+  "rewrites": [
+    { "source": "/api", "destination": "/api/health" },
+    { "source": "/api/", "destination": "/api/health" }
+  ],
   "functions": {
-    "api/[[...path]].ts": {
+    "api/[...path].ts": {
       "includeFiles": "{dist/**,prisma/schema.prisma,node_modules/@prisma/client/**,node_modules/.prisma/client/**,node_modules/@swisseph/node/**}",
       "maxDuration": 60
     }
