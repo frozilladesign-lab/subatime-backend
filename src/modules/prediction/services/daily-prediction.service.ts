@@ -507,6 +507,15 @@ export class DailyPredictionService {
       morningPayload = { ...morningPayload, slot: 'morning' };
     }
 
+    const clip = (t: string, n: number) => (t.length <= n ? t : `${t.slice(0, Math.max(0, n - 1)).trim()}…`);
+    const middayPayload: Record<string, unknown> = {
+      ...metaBase,
+      slot: 'midday',
+      title: 'Midday read',
+      body: clip(summary.trim(), 130),
+      summary: summary.length > 200 ? `${summary.slice(0, 197)}…` : summary,
+    };
+
     const eveningPayload: Record<string, unknown> = {
       ...metaBase,
       slot: 'evening',
@@ -523,11 +532,14 @@ export class DailyPredictionService {
     };
 
     const muteLearningTips = this.muteLearningTipsFromPreferences(user.preferences);
+    const tz = (tzNoon ?? '').trim() || 'UTC';
 
-    await this.upsertDaypartNotification(userId, 'daily', predictionDate, 7, morningPayload);
+    // Local civil times (birth-profile timezone) so pushes align with morning / noon / evening, not fixed UTC.
+    await this.upsertDaypartNotification(userId, 'daily', predictionDate, tz, 10, 0, morningPayload);
     if (!muteLearningTips) {
-      await this.upsertDaypartNotification(userId, 'daily_evening', predictionDate, 14, eveningPayload);
-      await this.upsertDaypartNotification(userId, 'daily_night', predictionDate, 22, nightPayload);
+      await this.upsertDaypartNotification(userId, 'daily_evening', predictionDate, tz, 12, 0, middayPayload);
+      await this.upsertDaypartNotification(userId, 'daily_evening', predictionDate, tz, 18, 0, eveningPayload);
+      await this.upsertDaypartNotification(userId, 'daily_night', predictionDate, tz, 21, 30, nightPayload);
     }
 
     return {
@@ -983,10 +995,12 @@ export class DailyPredictionService {
     userId: string,
     type: 'daily' | 'daily_evening' | 'daily_night',
     predictionDate: Date,
-    hourUtc: number,
+    timezone: string,
+    localHour: number,
+    localMinute: number,
     payload: Record<string, unknown>,
   ): Promise<void> {
-    const scheduledAt = this.atUtcTime(predictionDate, hourUtc, 0);
+    const scheduledAt = this.atUserLocalWallClock(predictionDate, timezone, localHour, localMinute);
     const job = await this.prisma.notificationJob.upsert({
       where: {
         userId_type_scheduledAt: {
@@ -1009,6 +1023,22 @@ export class DailyPredictionService {
     if (job.status !== 'sent') {
       await this.notificationQueue.enqueueSendNotification(job.id, job.scheduledAt);
     }
+  }
+
+  /** Interprets [predictionDate] as the user's plan calendar day (UTC midnight anchor) and [hour]/[minute] as wall time in [timezone]. */
+  private atUserLocalWallClock(predictionUtcMidnight: Date, timezone: string, hour: number, minute: number): Date {
+    const y = predictionUtcMidnight.getUTCFullYear();
+    const mo = predictionUtcMidnight.getUTCMonth() + 1;
+    const d = predictionUtcMidnight.getUTCDate();
+    const zone = (timezone ?? '').trim() || 'UTC';
+    const local = DateTime.fromObject({ year: y, month: mo, day: d, hour, minute }, { zone });
+    if (!local.isValid) {
+      this.logger.warn(
+        `daypart schedule: invalid local wall ${zone} ${y}-${mo}-${d} ${hour}:${minute} (${local.invalidReason ?? 'unknown'}) — using UTC`,
+      );
+      return this.atUtcTime(predictionUtcMidnight, hour, minute);
+    }
+    return local.toUTC().toJSDate();
   }
 
   private ruleExplainPrediction(facts: {
