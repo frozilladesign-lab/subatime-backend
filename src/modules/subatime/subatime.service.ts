@@ -1051,6 +1051,13 @@ export class SubatimeService {
         name: p.fullName,
         sign: p.zodiacSign,
         overall: p.compatibilityScore ?? null,
+        gender: p.gender,
+        dateOfBirth:
+          p.dateOfBirth instanceof Date
+            ? p.dateOfBirth.toISOString().slice(0, 10)
+            : String(p.dateOfBirth ?? '').slice(0, 10),
+        birthLocation: p.birthLocation,
+        timeOfBirth: p.timeOfBirth,
       })),
       'Match profiles fetched',
     );
