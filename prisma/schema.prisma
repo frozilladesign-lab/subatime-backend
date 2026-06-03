@@ -80,6 +80,7 @@ model User {
   predictionFeedback PredictionFeedback[]
   notificationJobs   NotificationJob[]
   deviceTokens       UserDeviceToken[]
+  sessions           UserSession[]
   matchResultsAsA    MatchResult[]        @relation("MatchUserA")
   matchResultsAsB    MatchResult[]        @relation("MatchUserB")
   aiExplanations     AiExplanation[]
@@ -89,6 +90,22 @@ model User {
   wellnessSnapshots  WellnessSnapshot[]
 
   @@map("users")
+}
+
+/// Refresh-token sessions (hash stored; raw token only returned once at login/refresh).
+model UserSession {
+  id               String    @id @default(uuid()) @db.Uuid
+  userId           String    @db.Uuid
+  refreshTokenHash String
+  deviceLabel      String?
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([refreshTokenHash])
+  @@map("user_sessions")
 }
 
 model WellnessSnapshot {
@@ -325,21 +342,3 @@ model UserDeviceToken {
   @@map("user_device_tokens")
 }
 
-/// Read-through cache for Gemini Sinhala (and future) translations — keyed by SHA-256 of canonical English JSON.
-model AiTranslationCache {
-  id          String   @id @default(uuid()) @db.Uuid
-  /// SHA-256 hex (64 chars) of `{ operation, model, body }`.
-  cacheKey    String   @unique @db.VarChar(64)
-  operation   String   @db.VarChar(64)
-  geminiModel String   @db.VarChar(128)
-  sourceLang  String   @default("en") @db.VarChar(8)
-  targetLang  String   @default("si") @db.VarChar(8)
-  resultJson  Json
-  expiresAt   DateTime
-  hitCount    Int      @default(0)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@index([operation, expiresAt])
-  @@map("ai_translation_cache")
-}

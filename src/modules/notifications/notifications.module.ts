@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { CalendarModule } from '../calendar/calendar.module';
+import { PredictionModule } from '../prediction/prediction.module';
 import { NotificationDeliveryService } from './notification-delivery.service';
+import { HourlyPredictionPushService } from './hourly-prediction-push.service';
 import { NotificationPushDispatcherService } from './notification-push-dispatcher.service';
 import { ProactiveHoraPushSchedulerService } from './proactive-hora-push.scheduler';
 import { PredictionWindowPushSchedulerService } from './prediction-window-push.scheduler';
@@ -12,7 +14,7 @@ import { PushModule } from '../push/push.module';
 import { UserModule } from '../user/user.module';
 
 @Module({
-  imports: [PushModule, UserModule, CalendarModule],
+  imports: [PushModule, UserModule, CalendarModule, PredictionModule],
   controllers: [NotificationsController],
   providers: [
     NotificationsService,
@@ -20,6 +22,7 @@ import { UserModule } from '../user/user.module';
     NotificationPushDispatcherService,
     ProactiveHoraPushSchedulerService,
     PredictionWindowPushSchedulerService,
+    HourlyPredictionPushService,
     NotificationQueueService,
     NotificationWorkerService,
   ],

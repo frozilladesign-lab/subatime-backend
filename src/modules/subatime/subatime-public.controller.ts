@@ -10,4 +10,12 @@ export class SubatimePublicController {
   getSkyToday(@Query('lang') lang?: string) {
     return this.subatimeService.getPublicSkyToday(lang);
   }
+
+  @Get('preview/day')
+  getGuestPreview(
+    @Query('birthDate') birthDate: string,
+    @Query('name') name?: string,
+  ) {
+    return this.subatimeService.getGuestPreviewDay(birthDate, name);
+  }
 }

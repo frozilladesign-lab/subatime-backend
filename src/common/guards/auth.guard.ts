@@ -1,8 +1,11 @@
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
 import { Request } from 'express';
+import { JwtTokenService } from '../../modules/auth/jwt-token.service';
 
 @Injectable()
 export class AuthGuard implements CanActivate {
+  constructor(private readonly jwt: JwtTokenService) {}
+
   canActivate(context: ExecutionContext): boolean {
     const req = context.switchToHttp().getRequest<Request & { user?: { id: string } }>();
     const auth = req.headers.authorization;
@@ -10,26 +13,19 @@ export class AuthGuard implements CanActivate {
       throw new UnauthorizedException('Missing bearer token');
     }
     const token = auth.slice('Bearer '.length).trim();
-    const userId = this.resolveUserId(token);
-    if (!userId) {
+    if (!token || token === 'undefined' || token === 'null') {
       throw new UnauthorizedException('Invalid bearer token');
     }
-    req.user = { id: userId };
-    return true;
-  }
-
-  private resolveUserId(token: string): string | null {
-    if (!token || token === 'undefined' || token === 'null') return null;
     if (token.startsWith('st_')) {
-      try {
-        const decoded = Buffer.from(token.slice(3), 'base64url').toString('utf8').trim();
-        if (!decoded || decoded === 'undefined' || decoded === 'null') return null;
-        return decoded;
-      } catch {
-        return null;
-      }
+      throw new UnauthorizedException('Legacy token rejected. Please log in again.');
     }
-    // Backward-compatible fallback for local/dev tokens that directly pass user id.
-    return token || null;
+    try {
+      const userId = this.jwt.verifyAccessToken(token);
+      req.user = { id: userId };
+      return true;
+    } catch (err) {
+      if (err instanceof UnauthorizedException) throw err;
+      throw new UnauthorizedException('Invalid bearer token');
+    }
   }
 }

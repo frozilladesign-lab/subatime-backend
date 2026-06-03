@@ -1,12 +1,18 @@
 import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { randomBytes, scryptSync, timingSafeEqual } from 'crypto';
 import { okResponse } from '../../common/utils/response.util';
-import { LoginDto, RegisterDto } from './dto/auth.dto';
+import { LoginDto, LogoutDto, RefreshDto, RegisterDto } from './dto/auth.dto';
 import { PrismaService } from '../../database/prisma.service';
+import { JwtTokenService } from './jwt-token.service';
+import { SessionService } from './session.service';
 
 @Injectable()
 export class AuthService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly jwt: JwtTokenService,
+    private readonly sessions: SessionService,
+  ) {}
 
   async register(dto: RegisterDto) {
     const prisma = this.prisma as any;
@@ -14,8 +20,6 @@ export class AuthService {
     const displayName = dto.fullName?.trim() ? dto.fullName.trim() : nameFromEmail;
     const existing = await prisma.user.findUnique({ where: { email: dto.email } });
     if (existing) {
-      // Backward compatibility: older demo accounts may exist without a password hash.
-      // Let "Create account" set a password for those records instead of hard-failing.
       if (!existing.passwordHash) {
         const upgraded = await prisma.user.update({
           where: { id: existing.id },
@@ -24,20 +28,9 @@ export class AuthService {
             passwordHash: this.hashPassword(dto.password),
           },
         });
-        const accessToken = this.issueAccessToken(upgraded.id);
-        return okResponse(
-          {
-            userId: upgraded.id,
-            email: upgraded.email,
-            fullName: upgraded.name,
-            accessToken,
-          },
-          'User registered',
-        );
+        return okResponse(await this.issueAuthResponse(upgraded.id, upgraded.email, upgraded.name), 'User registered');
       }
-      throw new BadRequestException(
-        'Email already registered. Please log in.',
-      );
+      throw new BadRequestException('Email already registered. Please log in.');
     }
     const user = await prisma.user.create({
       data: {
@@ -46,16 +39,7 @@ export class AuthService {
         passwordHash: this.hashPassword(dto.password),
       },
     });
-    const accessToken = this.issueAccessToken(user.id);
-    return okResponse(
-      {
-        userId: user.id,
-        email: user.email,
-        fullName: user.name,
-        accessToken,
-      },
-      'User registered',
-    );
+    return okResponse(await this.issueAuthResponse(user.id, user.email, user.name), 'User registered');
   }
 
   async login(dto: LoginDto) {
@@ -67,20 +51,42 @@ export class AuthService {
     if (!user.passwordHash || !this.verifyPassword(dto.password, user.passwordHash)) {
       throw new UnauthorizedException('Invalid email or password');
     }
-    const accessToken = this.issueAccessToken(user.id);
     return okResponse(
-      {
-        userId: user.id,
-        accessToken,
-        refreshToken: `${accessToken}_refresh`,
-        email: user.email,
-      },
+      await this.issueAuthResponse(user.id, user.email, user.name),
       'User logged in',
     );
   }
 
-  private issueAccessToken(userId: string): string {
-    return `st_${Buffer.from(userId).toString('base64url')}`;
+  async refresh(dto: RefreshDto) {
+    const rotated = await this.sessions.rotateSession(dto.refreshToken);
+    const { token: accessToken, expiresIn } = this.jwt.signAccessToken(rotated.userId);
+    return okResponse(
+      {
+        userId: rotated.userId,
+        accessToken,
+        refreshToken: rotated.refreshToken,
+        expiresIn,
+      },
+      'Token refreshed',
+    );
+  }
+
+  async logout(dto: LogoutDto) {
+    await this.sessions.revokeSession(dto.refreshToken);
+    return okResponse({ ok: true }, 'Logged out');
+  }
+
+  private async issueAuthResponse(userId: string, email: string, fullName: string) {
+    const { token: accessToken, expiresIn } = this.jwt.signAccessToken(userId);
+    const refreshToken = await this.sessions.createSession(userId);
+    return {
+      userId,
+      email,
+      fullName,
+      accessToken,
+      refreshToken,
+      expiresIn,
+    };
   }
 
   private hashPassword(password: string): string {
