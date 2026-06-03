@@ -116,4 +116,15 @@ export class SubatimeController {
   ) {
     return this.subatimeService.getNightlySummary(userId, Number(days ?? 30));
   }
+
+  @Get('retention/snapshot')
+  getRetentionSnapshot(@CurrentUserId() userId: string) {
+    return this.subatimeService.getRetentionSnapshot(userId);
+  }
+
+  /** POST /api/subatime/push/test — sends a real FCM push to all user's device tokens. */
+  @Post('push/test')
+  sendTestPush(@CurrentUserId() userId: string) {
+    return this.subatimeService.sendTestPush(userId);
+  }
 }

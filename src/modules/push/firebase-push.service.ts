@@ -109,11 +109,11 @@ export class FirebasePushService implements OnModuleInit {
   }
 
   private resolveCredential(): admin.credential.Credential | null {
+    // 1. Base64-encoded full service account JSON (best for Vercel/cloud).
     const b64 = process.env.FIREBASE_ADMIN_CREDENTIALS?.trim();
     if (b64) {
       try {
-        const json = Buffer.from(b64, 'base64').toString('utf8');
-        const parsed = JSON.parse(json) as ServiceAccount;
+        const parsed = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')) as ServiceAccount;
         return admin.credential.cert(parsed);
       } catch (e) {
         this.logger.error(`FIREBASE_ADMIN_CREDENTIALS is set but invalid: ${String(e)}`);
@@ -121,6 +121,7 @@ export class FirebasePushService implements OnModuleInit {
       }
     }
 
+    // 2. Path to service account JSON file.
     const pathFromEnv =
       process.env.FIREBASE_ADMIN_KEY_PATH?.trim() || process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
     if (pathFromEnv && existsSync(pathFromEnv)) {
@@ -133,6 +134,31 @@ export class FirebasePushService implements OnModuleInit {
       }
     }
 
+    // 3. Separate env vars — supports FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY.
+    //    Vercel env vars often have literal \n that must become real newlines in the private key.
+    const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY?.trim().replace(/\\n/g, '\n');
+    if (projectId && clientEmail && privateKey) {
+      try {
+        this.logger.log(`Firebase credential: using FIREBASE_PROJECT_ID=${projectId}`);
+        return admin.credential.cert({ projectId, clientEmail, privateKey } as ServiceAccount);
+      } catch (e) {
+        this.logger.error(`Separate FIREBASE_ env vars credential failed: ${String(e)}`);
+        return null;
+      }
+    }
+
     return null;
+  }
+
+  /** Returns which credential source is detected — safe to log, no secret values exposed. */
+  credentialSource(): string {
+    if (process.env.FIREBASE_ADMIN_CREDENTIALS?.trim()) return 'FIREBASE_ADMIN_CREDENTIALS';
+    const p = process.env.FIREBASE_ADMIN_KEY_PATH?.trim() || process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+    if (p) return `file:${p}`;
+    const pid = process.env.FIREBASE_PROJECT_ID?.trim();
+    if (pid && process.env.FIREBASE_CLIENT_EMAIL?.trim() && process.env.FIREBASE_PRIVATE_KEY?.trim()) return `project:${pid}`;
+    return 'none';
   }
 }

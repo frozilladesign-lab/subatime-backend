@@ -1,14 +1,32 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { okResponse } from '../../common/utils/response.util';
 import { PrismaService } from '../../database/prisma.service';
+import { FirebasePushService } from '../push/firebase-push.service';
 import { DreamExtractionService } from '../ai/services/dream-extraction.service';
-import { GeminiLanguageService } from '../ai/services/gemini-language.service';
 import { MatchingService } from '../matching/matching.service';
 import { FeedbackLearningService } from '../prediction/services/feedback-learning.service';
 import {
   DailyPredictionOutput,
   DailyPredictionService,
 } from '../prediction/services/daily-prediction.service';
+import {
+  getCachedPlanDayPayload,
+  setCachedPlanDayPayload,
+} from './plan-day-payload.cache';
+import { buildPlanDayCopy, windowLabelKey } from './copy-contract/copy-contract.builder';
+import type { FeedRowCopyContract } from './copy-contract/feed-copy-contract.interface';
+import {
+  buildFeedAvoidCopy,
+  buildFeedCharmCopy,
+  buildFeedDoCopy,
+  buildFeedDreamCopy,
+  buildFeedGroundingCopy,
+  buildFeedHowToReadCopy,
+  buildFeedPredictionCopy,
+  buildFeedRhythmCopy,
+  buildFeedSignalCopy,
+  relativeDayLabelCopy,
+} from './copy-contract/feed-copy-contract.builder';
 import {
   astroCodesForDream,
   computeDreamStress,
@@ -31,13 +49,59 @@ export class SubatimeService {
     private readonly prisma: PrismaService,
     private readonly matchingService: MatchingService,
     private readonly feedbackLearning: FeedbackLearningService,
-    private readonly geminiLanguage: GeminiLanguageService,
     private readonly dreamExtraction: DreamExtractionService,
     private readonly wellnessSnapshots: WellnessSnapshotService,
+    private readonly firebasePush: FirebasePushService,
   ) {}
+
+  /** Sends a test push to all device tokens for this user. Used to verify FCM pipeline. */
+  async sendTestPush(userId: string) {
+    const tokens = await this.prisma.userDeviceToken.findMany({
+      where: { userId },
+      select: { token: true, platform: true },
+    });
+
+    if (tokens.length === 0) {
+      return okResponse({ sent: 0, status: 'no_tokens', fcmReady: this.firebasePush.isReady() },
+        'No device tokens registered for this user. Open the app and allow notifications first.');
+    }
+
+    if (!this.firebasePush.isReady()) {
+      return okResponse({
+        sent: 0,
+        status: 'firebase_not_configured',
+        tokenCount: tokens.length,
+        credentialSource: this.firebasePush.credentialSource(),
+      }, 'Firebase Admin is not configured. Check FIREBASE_ environment variables in Vercel.');
+    }
+
+    const result = await this.firebasePush.sendEachToTokens({
+      tokens: tokens.map(t => t.token),
+      title: '✨ Subatime Test',
+      body: 'Push notifications are working! Your auspicious alerts are active.',
+      data: { alertType: 'TEST', type: 'guide' },
+    });
+
+    return okResponse({
+      sent: result.successCount,
+      failed: result.failureCount,
+      tokenCount: tokens.length,
+      status: result.successCount > 0 ? 'delivered' : 'all_failed',
+    }, result.successCount > 0
+      ? `Test notification sent to ${result.successCount} device(s).`
+      : 'All tokens failed — token may be expired or Firebase credentials invalid.');
+  }
 
   async getPlanDay(userId: string, date?: string, lang?: string) {
     const targetDate = this.parseDateOrToday(date);
+    const dateIso = targetDate.toISOString().slice(0, 10);
+    const normalizedLang = (lang ?? 'en').toLowerCase();
+
+    const cachedPayload = getCachedPlanDayPayload(userId, dateIso, normalizedLang);
+    if (cachedPayload) {
+      return okResponse(cachedPayload, 'Plan day fetched');
+    }
+
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { name: true },
@@ -50,11 +114,8 @@ export class SubatimeService {
       return okResponse(null, 'Birth profile required to generate plan');
     }
     const base = this.toDayPayload(prediction, user?.name);
-    const normalizedLang = (lang ?? 'en').toLowerCase();
-    if (normalizedLang === 'si') {
-      const localized = await this.localizeDailyPayloadSi(base, prediction);
-      return okResponse(localized, 'Plan day fetched');
-    }
+    // Client-side i18n via `copy` — skip runtime Gemini Sinhala for plan/day.
+    setCachedPlanDayPayload(userId, dateIso, normalizedLang, base);
     return okResponse(base, 'Plan day fetched');
   }
 
@@ -161,9 +222,8 @@ export class SubatimeService {
       await Promise.all(
         chunk.map(async (date) => {
           // Match `/plan/day` quality (Gemini polish when configured); month slots stay consistent with list/detail.
-          const prediction = await this.dailyPredictionService.generateForUser(userId, date, {
-            polishSummary: true,
-          });
+          // Month grid backfill: skip Gemini polish — dramatically faster; detail uses /plan/day.
+          const prediction = await this.dailyPredictionService.generateForUser(userId, date);
           if (!prediction) return;
           byIso.set(prediction.date, {
             date,
@@ -218,10 +278,8 @@ export class SubatimeService {
     );
   }
 
-  async getFeed(userId: string, limit: number, lang?: string) {
+  async getFeed(userId: string, limit: number, _lang?: string) {
     const safeLimit = Math.min(80, Math.max(8, limit || 30));
-    const contentLang =
-      typeof lang === 'string' && lang.toLowerCase().trim().startsWith('si') ? 'si' : 'en';
     const today = this.normalizeDate(new Date());
     const sevenDaysAgo = new Date(today.getTime() - 6 * 86_400_000);
     /** Each day expands into several cards (Do, Avoid, …); fetch enough parent rows before slicing. */
@@ -253,6 +311,7 @@ export class SubatimeService {
       date: string;
       dateLabel: string;
       source: string;
+      copy: FeedRowCopyContract;
       userLagna?: string | null;
       luckyNumber?: number;
       luckyColor?: string;
@@ -270,89 +329,115 @@ export class SubatimeService {
       const feedReflection = this.buildFeedReflectionLine(p.confidenceScore);
       const feedGrowth = this.buildFeedGrowthLine(p.confidenceScore, transitList.length);
       const dateStr = p.date.toISOString().slice(0, 10);
-      const dateLabel = this.relativeDayLabel(p.date, contentLang);
+      const dateLabel = this.relativeDayLabel(p.date, 'en');
+      const dateLabelCopy = relativeDayLabelCopy(p.date, today);
+      const attachDate = (copy: FeedRowCopyContract): FeedRowCopyContract => ({
+        ...copy,
+        dateLabel: dateLabelCopy,
+      });
 
       if (feedDoLines.length) {
         const body = feedDoLines.join('\n\n');
+        const copy = attachDate(buildFeedDoCopy(goodBlocks));
         predictionRows.push({
           id: `pred-${p.id}-do`,
           type: 'good',
-          title: contentLang === 'si' ? 'කරන්න' : 'Do',
+          title: 'Do',
           preview: summarizePreview(body),
           body,
           date: dateStr,
           dateLabel,
-          source: this.feedDoWindowsSource(contentLang),
+          source: this.feedDoWindowsSource('en'),
+          copy,
           ...(userLagna ? { userLagna } : {}),
         });
       }
       if (feedAvoidLines.length) {
         const body = feedAvoidLines.join('\n\n');
+        const copy = attachDate(buildFeedAvoidCopy(badBlocks));
         predictionRows.push({
           id: `pred-${p.id}-avoid`,
           type: 'avoid',
-          title: contentLang === 'si' ? 'වළක්වන්න' : 'Avoid',
+          title: 'Avoid',
           preview: summarizePreview(body),
           body,
           date: dateStr,
           dateLabel,
-          source: this.feedAvoidWindowsSource(contentLang),
+          source: this.feedAvoidWindowsSource('en'),
+          copy,
           ...(userLagna ? { userLagna } : {}),
         });
       }
-      if (feedQuote.trim().length) {
+      const signalCopy = buildFeedSignalCopy(summary, transitList);
+      if (signalCopy && feedQuote.trim().length) {
         predictionRows.push({
           id: `pred-${p.id}-signal`,
           type: 'quote',
-          title: contentLang === 'si' ? 'අද සංඥාව' : "Today's signal",
+          title: "Today's signal",
           preview: summarizePreview(feedQuote),
           body: feedQuote,
           date: dateStr,
           dateLabel,
-          source: this.feedTransitSignalSource(contentLang),
+          source: this.feedTransitSignalSource('en'),
+          copy: attachDate(signalCopy),
           ...(userLagna ? { userLagna } : {}),
         });
       }
       if (feedReflection.trim().length) {
+        const copy = attachDate(buildFeedGroundingCopy(p.confidenceScore));
         predictionRows.push({
           id: `pred-${p.id}-heart`,
           type: 'quote',
-          title: contentLang === 'si' ? 'හදවත සහ සංවරය' : 'Heart & gentle ritual',
+          title: 'Heart & gentle ritual',
           preview: summarizePreview(feedReflection),
           body: feedReflection,
           date: dateStr,
           dateLabel,
-          source: this.feedGroundingSource(contentLang),
+          source: this.feedGroundingSource('en'),
+          copy,
           ...(userLagna ? { userLagna } : {}),
         });
       }
       if (feedGrowth.trim().length) {
+        const copy = attachDate(
+          buildFeedHowToReadCopy(p.confidenceScore, transitList.length),
+        );
         predictionRows.push({
           id: `pred-${p.id}-how`,
           type: 'weekly',
-          title: contentLang === 'si' ? 'මෙය කියවන්නේ මෙසේය' : 'How to read this',
+          title: 'How to read this',
           preview: summarizePreview(feedGrowth),
           body: feedGrowth,
           date: dateStr,
           dateLabel,
-          source: this.feedModelNoteSource(contentLang),
+          source: this.feedModelNoteSource('en'),
+          copy,
           ...(userLagna ? { userLagna } : {}),
         });
       }
-      const rhythmBody = this.buildFeedDaypartRhythmBody(summary, goodBlocks, badBlocks, contentLang);
-      if (rhythmBody.trim().length) {
+      const rhythmCopy = buildFeedRhythmCopy(summary, goodBlocks, badBlocks);
+      const rhythmBody = this.buildFeedDaypartRhythmBody(summary, goodBlocks, badBlocks, 'en');
+      if (rhythmCopy && rhythmBody.trim().length) {
         predictionRows.push({
           id: `pred-${p.id}-rhythm`,
           type: 'quote',
-          title: contentLang === 'si' ? 'උදෑසන · සවස · රාත්‍රිය' : 'Morning · Evening · Night',
+          title: 'Morning · Evening · Night',
           preview: summarizePreview(rhythmBody),
           body: rhythmBody,
           date: dateStr,
           dateLabel,
-          source: this.feedDaypartRhythmSource(contentLang),
+          source: this.feedDaypartRhythmSource('en'),
+          copy: attachDate(rhythmCopy),
           ...(userLagna ? { userLagna } : {}),
         });
       }
+      const spread =
+        typeof p.scoreSpread === 'number' && Number.isFinite(p.scoreSpread)
+          ? p.scoreSpread
+          : 0.1;
+      const predCopy = attachDate(
+        buildFeedPredictionCopy(summary, p.confidenceScore, spread),
+      );
       predictionRows.push({
         id: `pred-${p.id}`,
         type: 'prediction',
@@ -361,7 +446,8 @@ export class SubatimeService {
         body: summary,
         date: dateStr,
         dateLabel,
-        source: this.feedPredictionSource(contentLang),
+        source: this.feedPredictionSource('en'),
+        copy: predCopy,
         ...(userLagna ? { userLagna } : {}),
       });
     }
@@ -369,55 +455,16 @@ export class SubatimeService {
     const todayIso = today.toISOString().slice(0, 10);
     const todayPred = predictions.find((p) => p.date.toISOString().slice(0, 10) === todayIso);
     const charmRow = todayPred
-      ? this.buildTodayCharmFeedRow(userId, todayPred, contentLang, userLagna ?? undefined)
+      ? this.buildTodayCharmFeedRow(userId, todayPred, userLagna ?? undefined, today)
       : null;
 
     const feedItems = [
       ...(charmRow ? [charmRow] : []),
       ...predictionRows,
-      ...dreams.map((d) => this.buildDreamFeedRow(d, contentLang)),
+      ...dreams.map((d) => this.buildDreamFeedRow(d, today)),
     ].sort((a, b) => (a.date < b.date ? 1 : -1));
 
     const sliced = feedItems.slice(0, safeLimit);
-
-    if (contentLang === 'si' && sliced.length > 0) {
-      const payloads = sliced.map((row) => ({
-        title: row.title,
-        preview: row.preview,
-        body: row.body,
-        source: row.source,
-        dreamStateLabel:
-          row.type === 'dream' ? ((row as { dreamStateLabel?: string | null }).dreamStateLabel ?? null) : null,
-        dreamInsight:
-          row.type === 'dream' ? ((row as { dreamInsight?: string | null }).dreamInsight ?? null) : null,
-        dreamGrounding:
-          row.type === 'dream' ? ((row as { dreamGrounding?: string | null }).dreamGrounding ?? null) : null,
-        dreamThemes:
-          row.type === 'dream' ? ((row as { dreamThemes?: string[] }).dreamThemes ?? undefined) : undefined,
-      }));
-      const translated = await this.geminiLanguage.localizeFeedRowsSi(payloads);
-      if (translated) {
-        for (let i = 0; i < sliced.length; i++) {
-          const t = translated[i];
-          const cur = sliced[i] as Record<string, unknown>;
-          sliced[i] = {
-            ...cur,
-            title: t.title,
-            preview: t.preview,
-            body: t.body,
-            source: t.source,
-            ...(cur.type === 'dream'
-              ? {
-                  dreamStateLabel: t.dreamStateLabel,
-                  dreamInsight: t.dreamInsight,
-                  dreamGrounding: t.dreamGrounding,
-                  dreamThemes: t.dreamThemes ?? cur.dreamThemes,
-                }
-              : {}),
-          } as (typeof feedItems)[number];
-        }
-      }
-    }
 
     return okResponse(sliced, 'Feed fetched');
   }
@@ -924,7 +971,7 @@ export class SubatimeService {
       createdAt: Date;
       analysis?: unknown;
     },
-    contentLang: string,
+    today: Date,
   ) {
     const analysis = (d.analysis ?? null) as Record<string, unknown> | null;
     const ext = analysis?.extraction as Record<string, unknown> | undefined;
@@ -937,10 +984,10 @@ export class SubatimeService {
     const grounding =
       typeof ext?.grounding_tip === 'string' ? String(ext.grounding_tip).trim() : '';
     const bandRaw = analysis?.band;
+    const band =
+      typeof bandRaw === 'string' && this.isDreamStressBand(bandRaw) ? bandRaw : null;
     const stateLabel =
-      typeof bandRaw === 'string' && this.isDreamStressBand(bandRaw)
-        ? dreamStressBandLabel(bandRaw, contentLang === 'si' ? 'si' : undefined)
-        : null;
+      band != null ? dreamStressBandLabel(band, 'en') : null;
 
     let preview = d.body.slice(0, 120);
     if (insight) {
@@ -953,6 +1000,16 @@ export class SubatimeService {
       preview = `${stateLabel} — ${preview}`.slice(0, 170);
     }
 
+    const copy = buildFeedDreamCopy({
+      title: d.title,
+      body: d.body,
+      band,
+      insight,
+      grounding,
+      themes,
+    });
+    copy.dateLabel = relativeDayLabelCopy(d.createdAt, today);
+
     return {
       id: `dream-${d.id}`,
       type: 'dream',
@@ -960,8 +1017,9 @@ export class SubatimeService {
       preview,
       body: d.body,
       date: d.createdAt.toISOString().slice(0, 10),
-      dateLabel: this.relativeDayLabel(d.createdAt, contentLang),
-      source: this.feedDreamSource(contentLang),
+      dateLabel: this.relativeDayLabel(d.createdAt, 'en'),
+      source: this.feedDreamSource('en'),
+      copy,
       dreamStateLabel: stateLabel,
       dreamThemes: themes,
       dreamSymbols: symbols,
@@ -1005,24 +1063,17 @@ export class SubatimeService {
   private buildTodayCharmFeedRow(
     userId: string,
     p: { id: string; date: Date; confidenceScore: number; scoreSpread: number },
-    contentLang: string,
-    userLagna?: string | null,
+    userLagna: string | undefined,
+    today: Date,
   ) {
     const dateStr = p.date.toISOString().slice(0, 10);
     const luck = this.luckyCharmFields(userId, dateStr, p.id);
-    const dateLabel = this.relativeDayLabel(p.date, contentLang);
-    const title =
-      contentLang === 'si'
-        ? `අදේ සුළු ආශීර්වාද · ${luck.luckyNumber}`
-        : `Today’s micro-charm · ${luck.luckyNumber}`;
-    const preview =
-      contentLang === 'si'
-        ? `${luck.luckyColor} — අද ඔබේ රිද්මයට මෘදු සලකුණක්.`
-        : `${luck.luckyColor} — a soft anchor for your rhythm today.`;
-    const body =
-      contentLang === 'si'
-        ? `අංකය ${luck.luckyNumber}. වර්ණය ${luck.luckyColor}. මෙය විනෝදාත්මක සංඥාවක් පමණක්—තීරණ ඔබේමය.`
-        : `Number ${luck.luckyNumber}. Color ${luck.luckyColor}. A playful ritual anchor, not destiny—your choices stay yours.`;
+    const dateLabel = this.relativeDayLabel(p.date, 'en');
+    const title = `Today’s micro-charm · ${luck.luckyNumber}`;
+    const preview = `${luck.luckyColor} — a soft anchor for your rhythm today.`;
+    const body = `Number ${luck.luckyNumber}. Color ${luck.luckyColor}. A playful ritual anchor, not destiny—your choices stay yours.`;
+    const copy = buildFeedCharmCopy(luck.luckyNumber, luck.luckyColor);
+    copy.dateLabel = relativeDayLabelCopy(p.date, today);
     return {
       id: `lucky-${p.id}`,
       type: 'charm' as const,
@@ -1031,7 +1082,8 @@ export class SubatimeService {
       body,
       date: dateStr,
       dateLabel,
-      source: this.feedCharmSource(contentLang),
+      source: this.feedCharmSource('en'),
+      copy,
       luckyNumber: luck.luckyNumber,
       luckyColor: luck.luckyColor,
       luckyColorHex: luck.luckyColorHex,
@@ -1321,6 +1373,108 @@ export class SubatimeService {
     );
   }
 
+  /**
+   * Lightweight retention metrics for guide home (weekly reflection, streak, adaptation flag).
+   */
+  async getRetentionSnapshot(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { accuracyScore: true },
+    });
+    const accuracyScore = user?.accuracyScore ?? 0.5;
+
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86_400_000);
+    const ninetyDaysAgo = new Date(Date.now() - 90 * 86_400_000);
+
+    const [weekRows, streakRows, totalFeedback] = await Promise.all([
+      this.prisma.predictionFeedback.findMany({
+        where: { userId, timestamp: { gte: sevenDaysAgo } },
+        select: {
+          feedback: true,
+          timestamp: true,
+          predictionId: true,
+          contextType: true,
+          actualOutcome: true,
+        },
+      }),
+      this.prisma.predictionFeedback.findMany({
+        where: { userId, timestamp: { gte: ninetyDaysAgo } },
+        select: { timestamp: true },
+        orderBy: { timestamp: 'desc' },
+        take: 120,
+      }),
+      this.prisma.predictionFeedback.count({ where: { userId } }),
+    ]);
+
+    const helpfulDayKeys = new Set<string>();
+    for (const row of weekRows) {
+      if (row.feedback === 'good' && row.predictionId) {
+        helpfulDayKeys.add(row.timestamp.toISOString().slice(0, 10));
+      }
+    }
+
+    const activityDays = new Set(
+      streakRows.map((r) => r.timestamp.toISOString().slice(0, 10)),
+    );
+    let reflectionStreak = 0;
+    const cursor = new Date();
+    for (let i = 0; i < 90; i += 1) {
+      const key = cursor.toISOString().slice(0, 10);
+      if (!activityDays.has(key)) break;
+      reflectionStreak += 1;
+      cursor.setUTCDate(cursor.getUTCDate() - 1);
+    }
+
+    const nightlyWeek = weekRows.filter((r) => r.contextType === 'overall');
+    let topHits = 0;
+    let stressHits = 0;
+    let eveningCalmSignals = 0;
+    for (const row of nightlyWeek) {
+      try {
+        const payload = JSON.parse(row.actualOutcome ?? '{}') as Record<string, any>;
+        const cal = payload?.calibration ?? {};
+        if (cal.topWindowHit === true) topHits += 1;
+        if (cal.stressWindowHit === true) stressHits += 1;
+        const best = String(payload?.bestEnergyWindow ?? '').toLowerCase();
+        if (best === 'evening' && row.feedback === 'good') eveningCalmSignals += 1;
+      } catch {
+        /* ignore malformed payloads */
+      }
+    }
+    const nightlyTotal = nightlyWeek.length;
+
+    let weeklyReflectionTheme: 'focus_timing' | 'calm_evening' | 'steady_habits' | 'early' =
+      'early';
+    if (nightlyTotal >= 2) {
+      const topRate = topHits / nightlyTotal;
+      const stressRate = stressHits / nightlyTotal;
+      if (eveningCalmSignals >= 2 || (eveningCalmSignals >= 1 && topRate >= 0.5)) {
+        weeklyReflectionTheme = 'calm_evening';
+      } else if (topRate >= stressRate + 0.12) {
+        weeklyReflectionTheme = 'focus_timing';
+      } else {
+        weeklyReflectionTheme = 'steady_habits';
+      }
+    } else if (totalFeedback >= 3) {
+      weeklyReflectionTheme = 'steady_habits';
+    }
+
+    const hasAdaptiveAdjustment =
+      totalFeedback >= 2 && Math.abs(accuracyScore - 0.5) >= 0.02;
+
+    return okResponse(
+      {
+        weeklyReflectionTheme,
+        helpfulDaysThisWeek: helpfulDayKeys.size,
+        daysInWeek: 7,
+        reflectionStreak,
+        hasAdaptiveAdjustment,
+        totalFeedbackCount: totalFeedback,
+      },
+      'Retention snapshot fetched',
+    );
+  }
+
   private toDayPayload(prediction: DailyPredictionOutput, userName?: string) {
     const rating = this.deriveRating(
       prediction.confidenceScore,
@@ -1345,7 +1499,35 @@ export class SubatimeService {
       rating === 'great' ||
       (rating === 'good' && prediction.confidenceScore >= 0.72);
 
+    const copyInput = {
+      rating,
+      focus: prediction.personalization.mostRelevantContext as
+        | 'overall'
+        | 'career'
+        | 'love'
+        | 'health',
+      confidenceScore: prediction.confidenceScore,
+      focusWeightPct: focusPct,
+      bestWindow: bestWindow
+        ? { start: bestWindow.start, end: bestWindow.end, label: bestWindow.label }
+        : undefined,
+      cautionWindow: cautionWindow
+        ? {
+            start: cautionWindow.start,
+            end: cautionWindow.end,
+            label: cautionWindow.label,
+          }
+        : undefined,
+    };
+
+    const copy = buildPlanDayCopy(copyInput);
+
     return {
+      meta: {
+        method: 'weighted-score-v3-local',
+        locale: 'agnostic',
+      },
+      copy,
       predictionId: prediction.predictionId,
       date: prediction.date,
       // Sidereal ascendant (Lagna); anchor for whole-sign house scoring (not tropical Sun sign).
@@ -1370,8 +1552,22 @@ export class SubatimeService {
       bestWindow: bestWindow
         ? `${bestWindow.label} (${bestWindow.start}-${bestWindow.end})`
         : null,
+      bestWindowSlot: bestWindow
+        ? {
+            labelKey: windowLabelKey(bestWindow.label),
+            start: bestWindow.start,
+            end: bestWindow.end,
+          }
+        : null,
       cautionWindow: cautionWindow
         ? `${cautionWindow.label} (${cautionWindow.start}-${cautionWindow.end})`
+        : null,
+      cautionWindowSlot: cautionWindow
+        ? {
+            labelKey: windowLabelKey(cautionWindow.label),
+            start: cautionWindow.start,
+            end: cautionWindow.end,
+          }
         : null,
       confidence: prediction.confidenceScore,
       luckyNumber: luck.luckyNumber,
@@ -1478,117 +1674,6 @@ export class SubatimeService {
           energy: 'නිවුණු සහ විමර්ශන කාලයක්—විවේකය සහ සැලැස්ම් කෙටියෙන්.',
         };
     }
-  }
-
-  private siCalendarParts(dateIso: string): { weekday: string; day: number; monthShort: string } {
-    const d = new Date(`${dateIso}T12:00:00.000Z`);
-    const weekdays = ['ඉරිදා', 'සඳුදා', 'අඟහරුවාදා', 'බදාදා', 'බ්‍රහස්පතින්දා', 'සිකුරාදා', 'සෙනසුරාදා'];
-    const months = ['ජන', 'පෙබ', 'මාර්', 'අප්‍රේ', 'මැයි', 'ජූනි', 'ජූලි', 'අගෝ', 'සැප්', 'ඔක්', 'නොවැ', 'දෙසැ'];
-    return {
-      weekday: weekdays[d.getUTCDay()],
-      day: d.getUTCDate(),
-      monthShort: months[d.getUTCMonth()],
-    };
-  }
-
-  private async localizeDailyPayloadSi(
-    base: any,
-    prediction: DailyPredictionOutput,
-  ): Promise<any> {
-    const signal = {
-      date: prediction.date,
-      lagna: prediction.meta.lagna || 'Unknown',
-      nakshatra: prediction.meta.nakshatra || 'Unknown',
-      bestWindow: base.bestWindow as string | null,
-      cautionWindow: base.cautionWindow as string | null,
-      focus: prediction.personalization.mostRelevantContext,
-      rating: base.rating as 'great' | 'good' | 'mixed' | 'tense',
-    };
-    const rendered = await this.geminiLanguage.renderDailySinhala(signal, {
-      guidance: String(base.guidance ?? ''),
-      bestWindow: base.bestWindow ?? null,
-      cautionWindow: base.cautionWindow ?? null,
-      focus: String(base.focus ?? ''),
-      actions: {
-        do: Array.isArray(base.actions?.do) ? base.actions.do : [],
-        avoid: Array.isArray(base.actions?.avoid) ? base.actions.avoid : [],
-      },
-    });
-    if (!rendered) {
-      return this.fallbackSinhala(base, prediction);
-    }
-    const phaseKey = String(base.moonPhase ?? base.moon?.phase ?? 'waxing-gibbous');
-    const siMoon = this.moonPhaseCopySi(phaseKey);
-    const cal = this.siCalendarParts(prediction.date);
-    return {
-      ...base,
-      headerLabel: `අද · ${cal.weekday} ${cal.day}`,
-      dayLabel: `${cal.weekday} · ${cal.day} ${cal.monthShort}`,
-      guidance: rendered.summary,
-      bestWindow: rendered.lucky_window || base.bestWindow,
-      cautionWindow:
-        rendered.stress_window?.trim() ||
-        base.cautionWindow,
-      reasoning: {
-        summary: [{ type: 'main_insight', text: rendered.main_insight }],
-        focus: [],
-        avoid: [],
-        timing: [],
-      },
-      actions: {
-        do: rendered.do.map((text, idx) => ({
-          id: `do-si-${idx + 1}`,
-          text,
-          category: 'overall',
-        })),
-        avoid: rendered.avoid.map((text, idx) => ({
-          id: `avoid-si-${idx + 1}`,
-          text,
-          category: 'overall',
-        })),
-      },
-      moon: {
-        ...(base.moon ?? {}),
-        phase: phaseKey,
-        phaseLabel: siMoon.label,
-        energy: siMoon.energy,
-      },
-      localized: { lang: 'si', title: rendered.title, warningLevel: rendered.warning_level },
-    };
-  }
-
-  private fallbackSinhala(base: any, prediction: DailyPredictionOutput): any {
-    const phaseKey = String(base.moonPhase ?? base.moon?.phase ?? 'waxing-gibbous');
-    const siMoon = this.moonPhaseCopySi(phaseKey);
-    const cal = this.siCalendarParts(prediction.date);
-    return {
-      ...base,
-      headerLabel: `අද · ${cal.weekday} ${cal.day}`,
-      dayLabel: `${cal.weekday} · ${cal.day} ${cal.monthShort}`,
-      guidance:
-        'අද දවසේ කාලය සන්සුන්ව තෝරාගත්තොත් හොඳ ප්‍රතිඵල අපේක්ෂා කරන්න පුළුවන්. වැදගත් කාර්ය සඳහා ශක්තියෙන් පිරුණු වේලාවක් තෝරාගෙන, දැඩි තීරණ ලිහිල් කාලයට කල් තබන්න.',
-      reasoning: {
-        summary: [
-          {
-            type: 'main_insight',
-            text: 'අද වඩාත් ගැලපෙන්නේ සැලසුමකට අනුව සන්සුන්ව වැඩ කරන ආකාරයටයි.',
-          },
-        ],
-        focus: [],
-        avoid: [],
-        timing: [],
-      },
-      moon: {
-        ...(base.moon ?? {}),
-        phase: phaseKey,
-        phaseLabel: siMoon.label,
-        energy: siMoon.energy,
-      },
-      localized: { lang: 'si', title: 'දිනපතා මාර්ගෝපදේශය', warningLevel: 'medium' },
-      cautionWindow: base.cautionWindow
-        ? `${base.cautionWindow} — මෙම කාලයේ බර දැනීමට ඉඩ ඇත; ලිහිල් කාර්ය සහ විවේකය ප්‍රමුඛ කරන්න.`
-        : base.cautionWindow,
-    };
   }
 
   private moonPhaseMeta(phase: string): {
@@ -1823,6 +1908,15 @@ export class SubatimeService {
   }
 
   /** UTC calendar lunar phase for “today” — same astronomy helpers as personalized plans; not tied to a user chart. */
+  getGuestPreviewDay(birthDate: string, displayName?: string) {
+    const norm = birthDate?.trim() ?? '';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(norm)) {
+      throw new BadRequestException('birthDate query required (YYYY-MM-DD)');
+    }
+    const preview = this.dailyPredictionService.previewForBirthDate(norm, displayName);
+    return okResponse(preview, 'Guest day preview');
+  }
+
   getPublicSkyToday(lang?: string) {
     const date = this.normalizeDate(new Date());
     const moonPhase = this.moonPhaseForDate(date);
