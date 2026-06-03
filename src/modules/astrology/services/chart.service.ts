@@ -195,6 +195,49 @@ export class ChartService implements OnModuleDestroy {
     return this.getNakshatra(moonLongitude);
   }
 
+  /**
+   * Sidereal longitude of a slow planet at a UTC instant.
+   * Supports saturn, jupiter, mars, rahu (True Node) and ketu (180° from rahu).
+   * Used by the scoring engine for slow-planet transit scoring.
+   */
+  planetSiderealLongitudeUtc(
+    dateUtc: Date,
+    planet: 'saturn' | 'jupiter' | 'mars' | 'rahu' | 'ketu',
+    ayanamsaMode?: string,
+  ): number {
+    if (process.env.CHART_ENGINE === 'legacy') {
+      const ay = this.computeAyanamsa(dateUtc, ayanamsaMode);
+      const lons = this.computeSiderealLongitudes(dateUtc, ay);
+      return lons[planet] ?? lons.saturn;
+    }
+    try {
+      const sidMode =
+        ayanamsaMode === 'krishnamurti' ? SiderealMode.Krishnamurti : SiderealMode.Lahiri;
+      setSiderealMode(sidMode);
+      setTopocentric(0, 0, 0);
+      const jd = dateToJulianDay(dateUtc);
+      const flags =
+        CalculationFlag.SwissEphemeris | CalculationFlag.Speed | CalculationFlag.Sidereal;
+      if (planet === 'rahu') {
+        return this.normalize(calculatePosition(jd, LunarPoint.TrueNode, flags).longitude);
+      }
+      if (planet === 'ketu') {
+        return this.normalize(
+          calculatePosition(jd, LunarPoint.TrueNode, flags).longitude + 180,
+        );
+      }
+      const swissPlanet =
+        planet === 'saturn' ? Planet.Saturn :
+        planet === 'jupiter' ? Planet.Jupiter :
+        Planet.Mars;
+      return this.normalize(calculatePosition(jd, swissPlanet, flags).longitude);
+    } catch {
+      const ay = this.computeAyanamsa(dateUtc, ayanamsaMode);
+      const lons = this.computeSiderealLongitudes(dateUtc, ay);
+      return lons[planet] ?? lons.saturn;
+    }
+  }
+
   private moonSiderealLongitudeLegacy(dateUtc: Date, ayanamsaMode?: string): number {
     const d = this.daysSinceJ2000(dateUtc);
     const tropical = this.moonLongitudeTropicalRefined(d);
@@ -761,12 +804,40 @@ export class ChartService implements OnModuleDestroy {
     }
 
     const next = NAKSHATRA_LORDS[cursor];
+    const yearsRemaining = Number((remaining - ageTracker).toFixed(2));
+
+    // Antara (sub-period) lord: cycle all 9 lords within the mahādaśā, starting from current lord.
+    const antara = this.computeAntaraLord(current, yearsRemaining);
+
     return {
       current,
-      yearsRemaining: Number((remaining - ageTracker).toFixed(2)),
+      yearsRemaining,
       next,
       sequenceStart: nakLord,
+      antara,
     };
+  }
+
+  /**
+   * Antara (sub-period) lord within the current mahādaśā.
+   * Each antara = (dashaYears × antaraLordYears) / 120.
+   */
+  private computeAntaraLord(
+    dashaLord: (typeof NAKSHATRA_LORDS)[number],
+    yearsRemainingInDasha: number,
+  ): string {
+    const dashaYears = MAHADASHA_YEARS[dashaLord] ?? 16;
+    const elapsedInDasha = Math.max(0, dashaYears - yearsRemainingInDasha);
+    const startIdx = (NAKSHATRA_LORDS as readonly string[]).indexOf(dashaLord);
+    if (startIdx < 0) return dashaLord;
+    let cursor = 0;
+    for (let i = 0; i < 9; i++) {
+      const antaraLord = NAKSHATRA_LORDS[(startIdx + i) % 9];
+      const antaraYears = (dashaYears * MAHADASHA_YEARS[antaraLord]) / 120;
+      if (cursor + antaraYears > elapsedInDasha) return antaraLord;
+      cursor += antaraYears;
+    }
+    return dashaLord;
   }
 
   private toPlanetarySignMap(longitudes: PlanetLongitudes): PlanetaryData {

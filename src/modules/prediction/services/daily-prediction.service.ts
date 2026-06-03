@@ -9,6 +9,7 @@ import { NotificationQueueService } from '../../notifications/queue/notification
 import { GenerateChartDto } from '../../astrology/dto/astrology.dto';
 import { okResponse } from '../../../common/utils/response.util';
 import { SubmitPredictionFeedbackDto } from '../dto/feedback.dto';
+import { invalidatePlanDayPayloadCache } from '../../subatime/plan-day-payload.cache';
 import { FeedbackLearningService } from './feedback-learning.service';
 import { GeminiService } from '../../ai/services/gemini.service';
 import { ScoringEngineService } from './scoring-engine.service';
@@ -47,11 +48,20 @@ export interface DailyPredictionOutput {
       | 'weighted-score-v2'
       | 'weighted-score-v2+gemini'
       | 'weighted-score-v3'
+      | 'weighted-score-v3-local'
       | 'weighted-score-v3+gemini';
     /** Sidereal Moon sign (Janma Rāśi) from birth chart. */
     janmaRasi?: string;
     /** Tara Bāla at local civil noon in birth-profile timezone (approximate daily snapshot). */
     taraAtBirthTimezoneNoon?: { index1To9: number; name: string };
+    /** Saturn's current transit house counted from Janma Rāśi (1–12). Sade Sati = houses 12, 1, 2. */
+    saturnTransitHouseFromMoon?: number;
+    /** True when Saturn is in Sade Sati position (houses 12, 1, or 2 from Janma Rāśi). */
+    sadeSati?: boolean;
+    /** Jupiter's current transit house counted from Janma Rāśi (1–12). House 11 is most auspicious. */
+    jupiterTransitHouseFromMoon?: number;
+    /** Current Antara (sub-period) lord within the Mahādaśā. */
+    antaraLord?: string;
   };
 }
 
@@ -157,7 +167,9 @@ export class DailyPredictionService {
 
     await this.feedbackLearning.recomputeUserAccuracy(userId);
     // Make feedback affect the very next read by regenerating today's prediction.
+    const todayIso = this.todayUTC().toISOString().slice(0, 10);
     await this.generateForUser(userId, this.todayUTC(), { forceRegenerate: true });
+    invalidatePlanDayPayloadCache(userId, todayIso);
 
     return okResponse(saved, 'Feedback captured');
   }
@@ -256,35 +268,12 @@ export class DailyPredictionService {
       personalization,
     };
 
-    let explanation: string;
-    let usedGemini = false;
-
-    if (this.gemini.isConfigured()) {
-      try {
-        const system = [
-          'Explain why the app produced this daily forecast.',
-          'Use ONLY the JSON facts — window lists, confidence score, personalization focus.',
-          'Describe how weighted scoring surfaces good vs cautious periods; do not invent new times.',
-          'Plain English, 4–8 sentences, no markdown.',
-          `Facts: ${JSON.stringify(facts)}`,
-        ].join('\n');
-        explanation = await this.gemini.generateContent(
-          system,
-          'Explain this prediction clearly for the user.',
-        );
-        usedGemini = true;
-      } catch (e) {
-        this.logger.warn(`Gemini prediction explain failed: ${String(e)}`);
-        explanation = this.ruleExplainPrediction(facts);
-      }
-    } else {
-      explanation = this.ruleExplainPrediction(facts);
-    }
+    const explanation = this.ruleExplainPrediction(facts);
 
     return okResponse(
       {
         explanation: explanation.trim(),
-        usedGemini,
+        usedGemini: false,
       },
       'Prediction explained',
     );
@@ -322,7 +311,7 @@ export class DailyPredictionService {
   }
 
   /**
-   * @param opts.polishSummary When false, skips Gemini summary polish (faster for calendar month backfill).
+   * @param opts.polishSummary When true, runs Gemini summary polish (off by default; UI uses copy templates).
    * @param opts.forceRegenerate When true, skips the DB cache and recomputes (cron, feedback refresh).
    */
   async generateForUser(
@@ -330,7 +319,7 @@ export class DailyPredictionService {
     date: Date,
     opts?: { polishSummary?: boolean; forceRegenerate?: boolean },
   ): Promise<DailyPredictionOutput | null> {
-    const polishSummary = opts?.polishSummary !== false;
+    const polishSummary = opts?.polishSummary === true;
     const predictionDay = this.normalizeDate(date);
 
     if (!opts?.forceRegenerate) {
@@ -428,7 +417,7 @@ export class DailyPredictionService {
       confidenceScore,
       personalization.mostRelevantContext,
     );
-    let summaryMethod: DailyPredictionOutput['meta']['method'] = 'weighted-score-v3';
+    let summaryMethod: DailyPredictionOutput['meta']['method'] = 'weighted-score-v3-local';
     if (polishSummary && this.gemini.isConfigured()) {
       try {
         summary = await this.refineSummaryWithGemini({
@@ -485,6 +474,25 @@ export class DailyPredictionService {
     const ayanamsaMode =
       typeof cd?.ayanamsaMode === 'string' ? (cd.ayanamsaMode as string) : undefined;
     const taraNoon = this.computeTaraAtLocalNoon(nakshatra, dateStr, tzNoon, ayanamsaMode);
+
+    // Saturn/Jupiter transit house from natal Moon sign — for Sade Sati UI and Jupiter transit card.
+    const natalMoonLon = typeof cd?.moonLongitude === 'number' ? (cd.moonLongitude as number) : null;
+    let saturnTransitHouseFromMoon: number | undefined;
+    let sadeSati: boolean | undefined;
+    let jupiterTransitHouseFromMoon: number | undefined;
+    let antaraLord: string | undefined;
+    if (natalMoonLon !== null) {
+      const norm = (v: number) => ((v % 360) + 360) % 360;
+      const satLon = this.chartService.planetSiderealLongitudeUtc(predictionDay, 'saturn', ayanamsaMode);
+      const jupLon = this.chartService.planetSiderealLongitudeUtc(predictionDay, 'jupiter', ayanamsaMode);
+      saturnTransitHouseFromMoon = Math.floor(norm(satLon - natalMoonLon) / 30) + 1;
+      jupiterTransitHouseFromMoon = Math.floor(norm(jupLon - natalMoonLon) / 30) + 1;
+      sadeSati = [12, 1, 2].includes(saturnTransitHouseFromMoon);
+    }
+    const dashaData = cd?.dasha as Record<string, unknown> | undefined;
+    if (dashaData?.antara && typeof dashaData.antara === 'string') {
+      antaraLord = dashaData.antara;
+    }
 
     const metaBase = {
       predictionId: dailyPrediction.id,
@@ -559,6 +567,10 @@ export class DailyPredictionService {
         method: summaryMethod,
         ...(janmaRasi.length ? { janmaRasi } : {}),
         ...(taraNoon ? { taraAtBirthTimezoneNoon: taraNoon } : {}),
+        ...(saturnTransitHouseFromMoon !== undefined ? { saturnTransitHouseFromMoon } : {}),
+        ...(sadeSati !== undefined ? { sadeSati } : {}),
+        ...(jupiterTransitHouseFromMoon !== undefined ? { jupiterTransitHouseFromMoon } : {}),
+        ...(antaraLord ? { antaraLord } : {}),
       },
     };
   }
@@ -1065,27 +1077,6 @@ export class DailyPredictionService {
     let body =
       summary.length > 140 ? `${summary.slice(0, 137).trim()}…` : summary;
 
-    if (this.gemini.isConfigured()) {
-      try {
-        const raw = await this.gemini.generateContent(
-          [
-            'Return ONLY compact JSON: {"title":"","body":""}.',
-            'title ≤ 36 characters; body ≤ 140 characters.',
-            'Friendly daily forecast teaser for a mobile push. No markdown.',
-          ].join('\n'),
-          `Forecast summary:\n${summary}`,
-        );
-        const m = raw.match(/\{[\s\S]*\}/);
-        if (m) {
-          const j = JSON.parse(m[0]) as { title?: string; body?: string };
-          if (j.title?.trim()) title = j.title.trim().slice(0, 40);
-          if (j.body?.trim()) body = j.body.trim().slice(0, 160);
-        }
-      } catch (e) {
-        this.logger.warn(`Gemini notification polish failed: ${String(e)}`);
-      }
-    }
-
     return {
       ...meta,
       title,
@@ -1117,5 +1108,155 @@ export class DailyPredictionService {
 
   private toDateString(date: Date): string {
     return date.toISOString().slice(0, 10);
+  }
+
+  /**
+   * Unauthenticated approximate preview from birth date only (noon, Colombo defaults).
+   * Does not persist predictions or charts.
+   */
+  previewForBirthDate(birthDate: string, displayName?: string) {
+    const birthDateNorm = birthDate.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(birthDateNorm)) {
+      throw new Error('birthDate must be YYYY-MM-DD');
+    }
+
+    const predictionDay = this.todayUTC();
+    const chart = this.chartService.generate({
+      fullName: displayName?.trim() || 'Guest',
+      birthDate: birthDateNorm,
+      birthTime: '12:00',
+      birthPlace: 'Colombo, Sri Lanka',
+      latitude: 6.9271,
+      longitude: 79.8612,
+      timezone: 'Asia/Colombo',
+    });
+
+    const cd = chart.chartData as Record<string, unknown>;
+    const lagna = String(cd?.lagna ?? chart.lagna);
+    const nakshatra = String(cd?.nakshatra ?? chart.nakshatra);
+    const planetaryData = (chart.planetaryData as Record<string, unknown>) ?? {};
+    const defaultWeights = {
+      overall: 0.7,
+      career: 0.5,
+      love: 0.5,
+      health: 0.5,
+    };
+    const personalization = this.buildPersonalization(defaultWeights, null, null);
+    const scored = this.scoringEngine.scoreBlocks({
+      blocks: this.buildTimeBlocks(),
+      lagna,
+      nakshatra,
+      date: predictionDay,
+      planetaryData,
+      feedbackWeightAdjustment: 1,
+      primaryContextWeight: personalization.primaryContextScoreMultiplier,
+      chartData: cd,
+      dataQuality: 0.72,
+    });
+
+    const goodTimes = [...scored].sort((a, b) => b.score - a.score).slice(0, 2).map((s) => s.block);
+    const badTimes = [...scored].sort((a, b) => a.score - b.score).slice(0, 2).map((s) => s.block);
+    const sortedByScore = [...scored].sort((a, b) => b.score - a.score);
+    const scoreSpread = Number(
+      (
+        (sortedByScore[0]?.score ?? 0.5) -
+        (sortedByScore[sortedByScore.length - 1]?.score ?? 0.5)
+      ).toFixed(4),
+    );
+    const confidenceScore = Number(
+      Math.min(
+        0.92,
+        Math.max(0.35, this.scoringEngine.calculateConfidence(scored, 0.72) * 0.85),
+      ).toFixed(4),
+    );
+
+    const best = goodTimes[0];
+    const caution = badTimes[0];
+    const rating = this.deriveGuestRating(confidenceScore, scoreSpread);
+    const headline = this.guestHeadlineForRating(rating);
+    const insight = this.buildGuestPreviewInsight(
+      best,
+      personalization.mostRelevantContext,
+    );
+
+    const formatWindow = (w: TimeBlock | undefined) =>
+      w ? `${w.label} (${w.start}-${w.end})` : null;
+
+    const topParts = sortedByScore[0]?.parts;
+    const reasoning = [
+      topParts
+        ? {
+            type: 'moon_transit',
+            text: 'Transit Moon position is weighted against your approximate birth chart.',
+            confidence: 'medium',
+          }
+        : null,
+      topParts
+        ? {
+            type: 'tara_bala',
+            text: 'Daily star rhythm (Tara Bāla) contributes to this window ranking.',
+            confidence: 'medium',
+          }
+        : null,
+      {
+        type: 'approximate',
+        text: 'Preview uses your birth date with a default time and place. Add exact details later for precision.',
+        confidence: 'high',
+      },
+    ].filter(Boolean);
+
+    return {
+      approximate: true,
+      date: this.toDateString(predictionDay),
+      rating,
+      headline,
+      bestWindow: formatWindow(best),
+      cautionWindow: formatWindow(caution),
+      insight,
+      focusContext: personalization.mostRelevantContext,
+      confidence: confidenceScore,
+      reasoning,
+    };
+  }
+
+  private deriveGuestRating(
+    confidenceScore: number,
+    scoreSpread: number,
+  ): 'great' | 'good' | 'mixed' | 'tense' {
+    if (confidenceScore >= 0.78 && scoreSpread >= 0.12) return 'great';
+    if (confidenceScore >= 0.62) return 'good';
+    if (confidenceScore >= 0.48) return 'mixed';
+    return 'tense';
+  }
+
+  private guestHeadlineForRating(rating: 'great' | 'good' | 'mixed' | 'tense'): string {
+    switch (rating) {
+      case 'great':
+        return 'Today feels bright and open.';
+      case 'good':
+        return 'Today feels steady.';
+      case 'mixed':
+        return 'Today feels mixed — pace yourself.';
+      case 'tense':
+        return 'Today may feel heavier — go gently.';
+    }
+  }
+
+  private buildGuestPreviewInsight(
+    best: TimeBlock | undefined,
+    context: ContextKey,
+  ): string {
+    const windowPhrase = best
+      ? `${best.label.toLowerCase()} around ${best.start}`
+      : 'your clearest window later today';
+    const contextPhrase =
+      context === 'career'
+        ? 'focused work and clear communication'
+        : context === 'love'
+          ? 'connection and honest conversation'
+          : context === 'health'
+            ? 'rest and steady self-care'
+            : 'balanced priorities';
+    return `You may find ${contextPhrase} more natural ${windowPhrase}. This is a preview - add your exact birth time and place to refine it.`;
   }
 }

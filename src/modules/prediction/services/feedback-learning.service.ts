@@ -77,7 +77,8 @@ export class FeedbackLearningService {
       select: { accuracyScore: true },
     });
     const accuracy = user?.accuracyScore ?? 0.5;
-    // Keep chart-derived scoring anchored; feedback tweaks margins only (±~3%).
-    return Number((1 + (accuracy - 0.5) * 0.06).toFixed(4));
+    // Feedback influence grows up to ±15% as data accumulates (was ±3%).
+    // Clamped in scoring engine too; higher ceiling lets heavy users see personalisation.
+    return Number((1 + (accuracy - 0.5) * 0.30).toFixed(4));
   }
 }

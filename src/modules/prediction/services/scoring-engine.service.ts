@@ -16,6 +16,11 @@ export type ScoreParts = {
   nakshatraTara: number;
   aspects: number;
   dasha: number;
+  antara: number;
+  slowTransits: number;
+  grahahDrishti: number;
+  rahuKetuTransit: number;
+  transitMoonDignity: number;
   dignityAndTime: number;
   finalScore: number;
 };
@@ -62,6 +67,31 @@ export class ScoringEngineService {
       typeof input.chartData?.ayanamsaMode === 'string' ? input.chartData.ayanamsaMode : undefined;
     const moonStrength = snap?.planetStrength?.moon ?? 0.55;
     const dashaLord = snap?.dashaLord ?? '';
+    const antaraLord = snap?.antaraLord ?? '';
+
+    // Slow planets are constant for the whole day — compute once outside the block loop.
+    const saturnLon = snap
+      ? this.chartService.planetSiderealLongitudeUtc(dayUtc, 'saturn', ayanamsaMode)
+      : null;
+    const jupiterLon = snap
+      ? this.chartService.planetSiderealLongitudeUtc(dayUtc, 'jupiter', ayanamsaMode)
+      : null;
+    const marsLon = snap
+      ? this.chartService.planetSiderealLongitudeUtc(dayUtc, 'mars', ayanamsaMode)
+      : null;
+    const rahuLon = snap
+      ? this.chartService.planetSiderealLongitudeUtc(dayUtc, 'rahu', ayanamsaMode)
+      : null;
+
+    const slowTransitDayN = snap && saturnLon !== null && jupiterLon !== null
+      ? this.slowPlanetTransitScore(saturnLon, jupiterLon, snap.natalMoonSid)
+      : 0.5;
+    const grahahDrishtiDayN = snap && saturnLon !== null && jupiterLon !== null && marsLon !== null
+      ? this.grahahDrishtiScore(saturnLon, jupiterLon, marsLon, snap.natalMoonSid)
+      : 0.5;
+    const rahuKetuDayN = snap && rahuLon !== null
+      ? this.rahuKetuTransitScore(rahuLon, snap.natalMoonSid)
+      : 0.5;
 
     return input.blocks.map((block, idx) => {
       const tMid = this.blockMidpointUtc(dayUtc, block);
@@ -89,21 +119,28 @@ export class ScoringEngineService {
         ? this.aspectLayerScore(transitMoon, snap.natalMoonSid, snap.natalSunSid, snap.ascendantLongitude)
         : 0.5;
       const dashaN = this.dashaMoonAffinity(dashaLord);
+      const antaraN = this.antaraAffinity(dashaLord, antaraLord);
+      const transitMoonDignityN = this.transitMoonDignity(transitMoon);
       const dignityN = moonStrength;
       const timeN = this.timeContextScore(tMid);
 
       const dignityAndTime = Number((0.5 * dignityN + 0.5 * timeN).toFixed(4));
 
+      // Full scoring formula — 9 classical layers, total = 1.00
       let combined =
-        0.3 * moonTransitN +
-        0.25 * nakTaraN +
-        0.2 * aspectN +
-        0.15 * dashaN +
-        0.05 * dignityN +
-        0.05 * timeN;
+        0.25 * moonTransitN +        // Gochara (Chandra lagna blend)
+        0.18 * nakTaraN +            // Tara Bāla (9-tara)
+        0.13 * aspectN +             // Transiting Moon aspects vs natal
+        0.09 * dashaN +              // Mahādaśā lord affinity
+        0.09 * antaraN +             // Antara (sub-period) lord affinity
+        0.09 * slowTransitDayN +     // Saturn / Jupiter house from Janma Rāśi
+        0.07 * grahahDrishtiDayN +   // Graha Drishti (special aspects) — NEW
+        0.06 * rahuKetuDayN +        // Rahu/Ketu transit vs Janma Rāśi — NEW
+        0.03 * transitMoonDignityN + // Transit Moon dignity (exalt/debil)
+        0.01 * timeN;                // Time-of-day context
 
       const feedbackM = Number(
-        Math.min(1.06, Math.max(0.94, input.feedbackWeightAdjustment)).toFixed(4),
+        Math.min(1.15, Math.max(0.85, input.feedbackWeightAdjustment)).toFixed(4),
       );
       const contextScale = input.primaryContextWeight ?? 1;
       combined *= feedbackM;
@@ -118,6 +155,11 @@ export class ScoringEngineService {
           nakshatraTara: nakTaraN,
           aspects: aspectN,
           dasha: dashaN,
+          antara: antaraN,
+          slowTransits: slowTransitDayN,
+          grahahDrishti: grahahDrishtiDayN,
+          rahuKetuTransit: rahuKetuDayN,
+          transitMoonDignity: transitMoonDignityN,
           dignityAndTime,
           finalScore: Number(combined.toFixed(4)),
         },
@@ -153,6 +195,7 @@ export class ScoringEngineService {
     natalSunSid: number;
     planetStrength: { moon: number };
     dashaLord: string;
+    antaraLord: string;
   } | null {
     if (!cd) return null;
     const asc = Number(cd.ascendantLongitude);
@@ -166,6 +209,8 @@ export class ScoringEngineService {
     const dasha = cd.dasha as Record<string, unknown> | undefined;
     const lordRaw = dasha?.current;
     const dashaLord = typeof lordRaw === 'string' ? lordRaw.trim() : '';
+    const antaraRaw = dasha?.antara;
+    const antaraLord = typeof antaraRaw === 'string' ? antaraRaw.trim() : '';
 
     return {
       ascendantLongitude: this.norm360(asc),
@@ -173,6 +218,7 @@ export class ScoringEngineService {
       natalSunSid: Number.isFinite(sun) ? this.norm360(sun) : this.norm360(moon + 90),
       planetStrength: { moon: Number.isFinite(moonStr) ? this.clamp01(moonStr) : 0.55 },
       dashaLord,
+      antaraLord,
     };
   }
 
@@ -280,6 +326,156 @@ export class ScoringEngineService {
   private fallbackHouseFromLagna(_lagna: string, idx: number): number {
     const cycle = [1, 5, 9, 4, 7, 10, 2, 11];
     return cycle[idx % cycle.length] ?? 3;
+  }
+
+  /**
+   * Antara (sub-period) lord affinity with the mahādaśā lord, 0–1.
+   * Uses classical natural planetary friendship/enmity table.
+   */
+  private antaraAffinity(dashaLord: string, antaraLord: string): number {
+    if (!dashaLord || !antaraLord) return 0.55;
+    if (dashaLord === antaraLord) return 0.88; // same lord = strong continuity
+
+    // Natural friends (mitra): score 0.75
+    const FRIENDS: Record<string, string[]> = {
+      Sun:     ['Moon', 'Mars', 'Jupiter'],
+      Moon:    ['Sun', 'Mercury'],
+      Mars:    ['Sun', 'Moon', 'Jupiter'],
+      Mercury: ['Sun', 'Venus'],
+      Jupiter: ['Sun', 'Moon', 'Mars'],
+      Venus:   ['Mercury', 'Saturn'],
+      Saturn:  ['Mercury', 'Venus'],
+      Rahu:    ['Saturn', 'Venus', 'Mercury'],
+      Ketu:    ['Mars', 'Venus', 'Saturn'],
+    };
+    // Natural enemies (shatru): score 0.30
+    const ENEMIES: Record<string, string[]> = {
+      Sun:     ['Venus', 'Saturn', 'Rahu', 'Ketu'],
+      Moon:    ['Rahu', 'Ketu'],
+      Mars:    ['Mercury', 'Rahu', 'Ketu'],
+      Mercury: ['Moon', 'Rahu', 'Ketu'],
+      Jupiter: ['Mercury', 'Venus', 'Rahu', 'Ketu'],
+      Venus:   ['Sun', 'Moon', 'Rahu', 'Ketu'],
+      Saturn:  ['Sun', 'Moon', 'Mars', 'Rahu', 'Ketu'],
+      Rahu:    ['Sun', 'Moon', 'Mars', 'Ketu'],
+      Ketu:    ['Sun', 'Moon', 'Mercury', 'Rahu'],
+    };
+
+    if (FRIENDS[dashaLord]?.includes(antaraLord)) return 0.75;
+    if (ENEMIES[dashaLord]?.includes(antaraLord)) return 0.30;
+    return 0.55; // neutral (sama)
+  }
+
+  /**
+   * Saturn & Jupiter transit quality relative to Janma Rāśi (natal Moon sign).
+   * This captures Sade Sati (Saturn transit over natal Moon ±1 sign) and
+   * Jupiter's beneficial/challenging transit houses — major Sri Lankan Jyotiṣya factors.
+   * Returns 0–1 combined score.
+   */
+  private slowPlanetTransitScore(saturnLon: number, jupiterLon: number, natalMoonSid: number): number {
+    // House of transit planet counted from natal Moon sign (Janma Rāśi)
+    const houseFromMoon = (transitLon: number): number =>
+      Math.floor(this.norm360(transitLon - natalMoonSid) / 30) + 1;
+
+    const satHouse = houseFromMoon(saturnLon);
+    const jupHouse = houseFromMoon(jupiterLon);
+
+    // Saturn transit quality: Sade Sati = houses 12, 1, 2 (very difficult)
+    // Houses 3, 6, 11 = ok; 10 = mixed but industrious; rest = challenging
+    let saturnScore: number;
+    if ([12, 1, 2].includes(satHouse)) saturnScore = 0.18;      // Sade Sati
+    else if ([3, 6, 11].includes(satHouse)) saturnScore = 0.72; // Favourable Saturn houses
+    else if (satHouse === 10) saturnScore = 0.52;                // Work-heavy but ok
+    else saturnScore = 0.35;                                      // Challenging transit
+
+    // Jupiter transit quality: 2, 5, 7, 9, 11 = favourable (Guru transit good houses)
+    // 8, 12 = difficult; others = moderate
+    let jupiterScore: number;
+    if (jupHouse === 11) jupiterScore = 0.92;                    // Best Jupiter transit
+    else if ([2, 5, 9].includes(jupHouse)) jupiterScore = 0.80; // Very favourable
+    else if (jupHouse === 7) jupiterScore = 0.70;                // Moderately good
+    else if ([8, 12].includes(jupHouse)) jupiterScore = 0.28;   // Difficult
+    else if ([6].includes(jupHouse)) jupiterScore = 0.42;        // Mixed
+    else jupiterScore = 0.55;                                     // Neutral
+
+    // Saturn weighs slightly more — it has bigger negative impact in Sri Lankan practice
+    return this.clamp01(0.55 * saturnScore + 0.45 * jupiterScore);
+  }
+
+  /**
+   * Graha Drishti — special house aspects of slow planets onto natal Moon sign.
+   * Saturn aspects 3rd, 7th, 10th sign from itself (malefic drishti on Moon = reduce).
+   * Jupiter aspects 5th, 7th, 9th sign (benefic drishti on Moon = boost).
+   * Mars aspects 4th, 7th, 8th sign (malefic drishti on Moon = reduce).
+   * Returns 0–1 combined quality.
+   */
+  private grahahDrishtiScore(
+    saturnLon: number,
+    jupiterLon: number,
+    marsLon: number,
+    natalMoonSid: number,
+  ): number {
+    const signOf = (lon: number) => Math.floor(this.norm360(lon) / 30); // 0–11
+    const natalMoonSign = signOf(natalMoonSid);
+
+    const aspectsSign = (planetSign: number, offsets: number[]): boolean =>
+      offsets.some((o) => (planetSign + o - 1 + 12) % 12 === natalMoonSign);
+
+    // Jupiter drishti on natal Moon → benefic boost
+    const jupDrishti = aspectsSign(signOf(jupiterLon), [5, 7, 9]);
+    // Saturn drishti on natal Moon → malefic reduction
+    const satDrishti = aspectsSign(signOf(saturnLon), [3, 7, 10]);
+    // Mars drishti on natal Moon → malefic reduction (stronger than Saturn)
+    const marsDrishti = aspectsSign(signOf(marsLon), [4, 7, 8]);
+
+    let score = 0.55; // neutral baseline
+    if (jupDrishti) score += 0.20;
+    if (satDrishti) score -= 0.18;
+    if (marsDrishti) score -= 0.22;
+    return this.clamp01(score);
+  }
+
+  /**
+   * Rahu / Ketu transit quality relative to Janma Rāśi (natal Moon sign).
+   * Rahu moves retrograde ~1.5 years per sign — major life-phase influence.
+   * Returns 0–1.
+   */
+  private rahuKetuTransitScore(rahuLon: number, natalMoonSid: number): number {
+    const rahuHouse = Math.floor(this.norm360(rahuLon - natalMoonSid) / 30) + 1; // 1–12
+    const ketuHouse = ((rahuHouse + 5) % 12) + 1; // always opposite
+
+    // Rahu quality from Janma Rāśi
+    let rahuScore: number;
+    if ([3, 6, 11].includes(rahuHouse)) rahuScore = 0.72;      // Upachaya = growth
+    else if ([1, 2, 12].includes(rahuHouse)) rahuScore = 0.28; // Very challenging
+    else if ([5, 9].includes(rahuHouse)) rahuScore = 0.42;     // Spiritual; worldly mixed
+    else if ([4, 7].includes(rahuHouse)) rahuScore = 0.38;     // Unstable
+    else rahuScore = 0.52;                                      // Moderate
+
+    // Ketu quality from Janma Rāśi (moksha-karaka; detachment)
+    let ketuScore: number;
+    if ([3, 6, 11].includes(ketuHouse)) ketuScore = 0.68;
+    else if ([1, 12].includes(ketuHouse)) ketuScore = 0.32;
+    else if ([5, 9].includes(ketuHouse)) ketuScore = 0.60;     // Spiritually beneficial
+    else ketuScore = 0.50;
+
+    return this.clamp01(0.60 * rahuScore + 0.40 * ketuScore);
+  }
+
+  /**
+   * Transit Moon dignity: exaltation / own sign / debilitation.
+   * Moon exalted in Vrishabha (Taurus), debilitated in Vrischika (Scorpio),
+   * own sign Karka (Cancer). Returns 0–1.
+   */
+  private transitMoonDignity(transitMoonLon: number): number {
+    const signIdx = Math.floor(this.norm360(transitMoonLon) / 30); // 0=Mesha … 11=Meena
+    // Vrishabha=1 (exalt), Karka=3 (own), Vrischika=7 (debil)
+    if (signIdx === 1) return 1.0;   // Exaltation (Vrishabha)
+    if (signIdx === 3) return 0.85;  // Own sign (Karka)
+    if (signIdx === 7) return 0.15;  // Debilitation (Vrischika)
+    // Friendly signs for Moon: Mesha, Mithuna, Simha, Kanya, Dhanu, Meena
+    if ([0, 2, 4, 5, 8, 11].includes(signIdx)) return 0.65;
+    return 0.50; // neutral
   }
 
   private clamp01(v: number): number {
