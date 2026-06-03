@@ -353,23 +353,42 @@ export class DailyPredictionService {
       orderBy: { version: 'desc' },
     });
 
+    // Always regenerate so userKnownLagna override is applied — stored chart may pre-date the override.
     const generatedChart = this.chartService.generate(this.buildChartDto(user.name, user.birthProfile));
-    const chart =
-      existingChart ??
-      (await this.prisma.astrologyChart.create({
-        data: {
-          birthProfileId: user.birthProfile.id,
-          version: 1,
-          chartData: generatedChart.chartData as Prisma.InputJsonValue,
-          planetaryData: generatedChart.planetaryData,
-        },
-      }));
 
-    const cd = chart.chartData as Record<string, unknown>;
-    const lagna = String(cd?.lagna ?? generatedChart.lagna);
-    const nakshatra = String(cd?.nakshatra ?? generatedChart.nakshatra);
+    const userKnownLagna = user.birthProfile!.userKnownLagna?.trim() ?? '';
+    const chart = await (async () => {
+      if (!existingChart) {
+        return this.prisma.astrologyChart.create({
+          data: {
+            birthProfileId: user.birthProfile!.id,
+            version: 1,
+            chartData: generatedChart.chartData as Prisma.InputJsonValue,
+            planetaryData: generatedChart.planetaryData,
+          },
+        });
+      }
+      // If user has set a Lagna override, update the stored chart so it reflects the override.
+      const storedLagna = (existingChart.chartData as Record<string, unknown>)?.lagna as string | undefined;
+      if (userKnownLagna && storedLagna !== generatedChart.lagna) {
+        await this.prisma.astrologyChart.update({
+          where: { id: existingChart.id },
+          data: {
+            chartData: generatedChart.chartData as Prisma.InputJsonValue,
+            planetaryData: generatedChart.planetaryData,
+          },
+        });
+      }
+      return existingChart;
+    })();
+
+    // Always use generatedChart for scoring — it respects userKnownLagna override even when
+    // existingChart was stored before the user set their ascendant in step 8.
+    const cd = generatedChart.chartData as Record<string, unknown>;
+    const lagna = generatedChart.lagna;
+    const nakshatra = generatedChart.nakshatra;
     const blocks = this.buildTimeBlocks();
-    const planetaryData = (chart.planetaryData as Record<string, unknown>) ?? {};
+    const planetaryData = generatedChart.planetaryData as Record<string, unknown>;
     const weightAdjustment = await this.feedbackLearning.getWeightAdjustment(userId);
     const contextWeights = await this.feedbackLearning.getUserContextWeights(userId);
     const personalization = this.buildPersonalization(
