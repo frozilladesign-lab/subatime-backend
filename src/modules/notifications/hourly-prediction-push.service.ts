@@ -89,11 +89,17 @@ export class HourlyPredictionPushService {
         });
 
         const tokens = user.deviceTokens.map(t => t.token);
+        const todayISO = now.toISOString().slice(0, 10);
         const result = await this.push.sendEachToTokens({
           tokens,
           title: content.title,
           body:  content.body,
-          data:  { type: 'guide', alertType: 'BLOCK_START', blockLabel: block.label },
+          data:  {
+            type:         'feed',          // routes to Feed tab on tap
+            alertType:    'BLOCK_START',
+            blockLabel:   block.label,
+            planDate:     todayISO,
+          },
         });
 
         if (result.successCount > 0) {
