@@ -5,6 +5,7 @@ import { DailyPredictionService } from '../prediction/services/daily-prediction.
 import { FirebasePushService, isUnregisteredFcmError } from '../push/firebase-push.service';
 
 type Block = { start: string; end: string; label: string };
+type Transit = { id: string; type: string; title: string; description: string; intensity: number };
 
 const ENGINE_BLOCKS: Block[] = [
   { start: '06:00', end: '08:00', label: 'Early Morning' },
@@ -18,14 +19,17 @@ const ENGINE_BLOCKS: Block[] = [
 ];
 
 /**
- * Fires at the START of each engine time block in the user's local timezone.
- * Content is built purely from the prediction engine output — no external AI.
- * Scales to any number of users with zero per-user API cost.
+ * Accurate block notifications — content sourced directly from prediction engine:
+ *   - goodTimes / badTimes → which block is peak/caution
+ *   - transits → the ACTUAL planetary events driving the day's energy
+ *   - summary → contains specific best-window timing from the engine
+ *   - dominantContext + confidenceScore → personalises the message tone
+ *   - Sade Sati / Jupiter transit meta → adds astrological accuracy
  */
 @Injectable()
 export class HourlyPredictionPushService {
   private readonly logger = new Logger(HourlyPredictionPushService.name);
-  private readonly _sent = new Set<string>(); // userId:blockStart:dateISO
+  private readonly _sent = new Set<string>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -68,30 +72,50 @@ export class HourlyPredictionPushService {
         const dedupKey = `${user.id}:${block.start}:${dateKey}`;
         if (this._sent.has(dedupKey)) continue;
 
-        // Get today's prediction
-        const output = await this.dailyPrediction.generateForUser(user.id, now);
-        if (!output) continue;
-
-        const goodTimes = output.goodTimes as Block[];
-        const badTimes  = output.badTimes  as Block[];
-
-        const isPeak    = goodTimes.some(b => b.start === block.start);
-        const isPeak2   = goodTimes[1]?.start === block.start;
-        const isCaution = badTimes.some(b => b.start === block.start);
-
-        // Pull do/avoid from the stored prediction payload
-        const stored = await this.prisma.dailyPrediction.findUnique({
+        // ── Get stored prediction (has transits, goodTimes, badTimes, meta) ──
+        const storedPred = await this.prisma.dailyPrediction.findUnique({
           where: { userId_date: { userId: user.id, date: this.startOfDay(now, tz) } },
-          select: { goodTimes: true, badTimes: true, summary: true },
+          select: {
+            goodTimes: true, badTimes: true, transits: true,
+            summary: true, confidenceScore: true, dominantContext: true,
+            scoreSpread: true,
+          },
         });
 
+        // Generate if missing
+        const output = storedPred ?? await this.dailyPrediction.generateForUser(user.id, now);
+        if (!output) continue;
+
+        const goodTimes = (storedPred?.goodTimes ?? (output as any).goodTimes ?? []) as Block[];
+        const badTimes  = (storedPred?.badTimes  ?? (output as any).badTimes  ?? []) as Block[];
+        const transits  = (storedPred?.transits  ?? (output as any).transits  ?? []) as Transit[];
+        const summary   = storedPred?.summary ?? (output as any).summary ?? '';
+        const confidence = storedPred?.confidenceScore ?? (output as any).confidenceScore ?? 0.5;
+        const context    = storedPred?.dominantContext ?? (output as any).personalization?.mostRelevantContext ?? 'overall';
+
+        // Fetch meta for Sade Sati / Jupiter transit accuracy
+        const chart = await this.prisma.astrologyChart.findFirst({
+          where: { birthProfile: { userId: user.id } },
+          orderBy: { version: 'desc' },
+          select: { chartData: true },
+        });
+        const chartData = chart?.chartData as Record<string, unknown> | undefined;
+        const lagna      = String(chartData?.lagna ?? '');
+        const nakshatra  = String(chartData?.nakshatra ?? '');
+        const dasha      = chartData?.dasha as Record<string, unknown> | undefined;
+        const dashaLord  = String(dasha?.current ?? '');
+        const antaraLord = String(dasha?.antara  ?? '');
+
+        const isPeak1   = goodTimes[0]?.start === block.start;
+        const isPeak2   = goodTimes[1]?.start === block.start;
+        const isCaution = badTimes[0]?.start  === block.start;
+        const isWeak    = badTimes[1]?.start  === block.start;
+
         const content = this.buildContent({
-          block, isPeak, isPeak2, isCaution,
-          summary: output.summary,
-          lagna: String(output.meta.lagna ?? ''),
-          nakshatra: String(output.meta.nakshatra ?? ''),
-          context: output.personalization.mostRelevantContext,
-          confidence: output.confidenceScore,
+          block, isPeak1, isPeak2, isCaution, isWeak,
+          goodTimes, badTimes, transits, summary,
+          confidence, context, lagna, nakshatra,
+          dashaLord, antaraLord,
         });
 
         const tokens = user.deviceTokens.map(t => t.token);
@@ -105,7 +129,7 @@ export class HourlyPredictionPushService {
         if (result.successCount > 0) {
           sent += result.successCount;
           this._sent.add(dedupKey);
-          this.logger.log(`[${block.label}] ${user.name ?? user.id.slice(0,8)}: "${content.title}"`);
+          this.logger.log(`[${block.label}] ${user.name ?? user.id.slice(0,8)}: "${content.title}" | "${content.body.slice(0,50)}"`);
         }
 
         result.responses.forEach((r, i) => {
@@ -118,110 +142,128 @@ export class HourlyPredictionPushService {
       }
     }
 
-    if (sent > 0) this.logger.log(`BlockPush: ${sent} sent`);
+    if (sent > 0) this.logger.log(`BlockPush total: ${sent} sent`);
   }
 
-  // ── Content — pure prediction engine data, no AI ─────────────────────────
+  // ── Accurate content from engine data ────────────────────────────────────
 
   private buildContent(p: {
     block: Block;
-    isPeak: boolean; isPeak2: boolean; isCaution: boolean;
-    summary: string;
-    lagna: string; nakshatra: string; context: string; confidence: number;
+    isPeak1: boolean; isPeak2: boolean; isCaution: boolean; isWeak: boolean;
+    goodTimes: Block[]; badTimes: Block[]; transits: Transit[];
+    summary: string; confidence: number; context: string;
+    lagna: string; nakshatra: string; dashaLord: string; antaraLord: string;
   }): { title: string; body: string } {
+    const emoji  = this.lagnaEmoji(p.lagna);
     const rating = this.ratingFromScore(p.confidence);
-    const nakSign = this.nakshatraSign(p.nakshatra); // Moon sign from nakshatra
-    const lagnaEmoji = this.lagnaEmoji(p.lagna);
 
-    // ── Peak hora — best scored block ──────────────────────────────────────
-    if (p.isPeak) {
-      const actionLine = this.actionFromContext(p.context, rating, true);
+    // ── PEAK HORA — actual best window from engine ──────────────────────────
+    if (p.isPeak1) {
+      // Find best matching transit for this block (opportunity type first)
+      const transit = this.bestTransitForBlock(p.transits, 'opportunity') ??
+                      this.bestTransitForBlock(p.transits, 'neutral');
+      const body = transit
+        ? this.trimTransit(transit.description, 90)
+        : this.peakBodyFromContext(p.context, rating, p.dashaLord);
       return {
-        title: `${lagnaEmoji} ${p.block.label} — ✨ Peak hora`,
-        body:  actionLine,
+        title: `${emoji} ${p.block.label} — ✨ Peak hora`,
+        body,
       };
     }
 
-    // ── Second-best block ──────────────────────────────────────────────────
+    // ── SECOND BEST ────────────────────────────────────────────────────────
     if (p.isPeak2) {
+      const transit = this.bestTransitForBlock(p.transits, 'opportunity');
       return {
         title: `✦ ${p.block.label} — Strong window`,
-        body:  this.contextLine(p.context, p.block.start, rating),
+        body: transit
+          ? this.trimTransit(transit.description, 90)
+          : `Good ${p.context} energy. Keep steady momentum.`,
       };
     }
 
-    // ── Caution hora — worst scored block ─────────────────────────────────
+    // ── CAUTION HORA — actual worst window from engine ──────────────────────
     if (p.isCaution) {
-      const avoidLine = this.actionFromContext(p.context, rating, false);
+      // Use challenge transit description for body — it explains WHY
+      const transit = this.bestTransitForBlock(p.transits, 'challenge');
+      const body = transit
+        ? this.trimTransit(transit.description, 90)
+        : this.cautionBodyFromContext(p.context, rating, p.dashaLord);
       return {
-        title: `⚠️ ${p.block.label} — Low energy`,
-        body:  avoidLine,
+        title: `⚠️ ${p.block.label} — Low-energy hora`,
+        body,
       };
     }
 
-    // ── Neutral — time-of-day + rating guidance ────────────────────────────
+    // ── WEAK BLOCK ──────────────────────────────────────────────────────────
+    if (p.isWeak) {
+      return {
+        title: `· ${p.block.label} — Go gently`,
+        body: `${rating === 'tense' ? 'Conserve energy.' : 'Lighter tasks serve you better now.'}`,
+      };
+    }
+
+    // ── NEUTRAL — time + rating + dasha lord ────────────────────────────────
     return {
       title: `· ${p.block.label}`,
-      body:  this.neutralLine(p.block.start, rating, p.context),
+      body:  this.neutralBody(p.block.start, rating, p.context, p.dashaLord),
     };
   }
 
-  // ── Copy tables — prediction engine data as notification copy ─────────────
+  // ── Transit helpers ────────────────────────────────────────────────────────
 
-  private actionFromContext(context: string, rating: string, isDo: boolean): string {
-    const lines: Record<string, Record<string, [string, string]>> = {
-      career: {
-        great:  ['Lead the meeting. Your presence is at its sharpest now.', 'Skip the risky pitch. Prepare it instead.'],
-        good:   ['Move the most important work item forward now.', 'Stick to known tasks. Avoid new commitments.'],
-        mixed:  ['One focused task only — no multitasking.', 'Postpone decisions that need full clarity.'],
-        tense:  ['Protect your energy. Finish, don\'t start.', 'Delay negotiations. Low confidence window.'],
-      },
-      love: {
-        great:  ['Reach out to someone who matters. Connection flows now.', 'Avoid difficult conversations — wait for a better time.'],
-        good:   ['Express appreciation. Small gestures land well.', 'Don\'t push for answers. Let things unfold.'],
-        mixed:  ['Listen more than you speak in relationships now.', 'Avoid making promises you\'re unsure about.'],
-        tense:  ['Keep heart matters gentle today. Rest together.', 'Avoid heavy emotional conversations now.'],
-      },
-      health: {
-        great:  ['Move your body. High physical energy — use it.', 'Avoid overexertion. Rest is progress too.'],
-        good:   ['Consistent routine works best right now.', 'Don\'t skip recovery time today.'],
-        mixed:  ['Light activity only. Mixed signals from the body.', 'Avoid stimulants. Energy is uneven today.'],
-        tense:  ['Rest is the most healing act right now.', 'Avoid intense workouts. Body needs recovery.'],
-      },
-      overall: {
-        great:  ['Best energy of the day is here. Act on what matters most.', 'Save complex decisions for later.'],
-        good:   ['Steady progress. Take one clear step forward.', 'Avoid spreading attention. One thing at a time.'],
-        mixed:  ['Grounded action over speed. Quality over quantity.', 'Let ambiguous situations breathe.'],
-        tense:  ['Patience. Low energy — protect what you have.', 'Avoid new commitments. Hold steady.'],
-      },
-    };
-    const ctx = lines[context] ?? lines['overall'];
-    const pair = ctx[rating] ?? ctx['good'];
-    return isDo ? pair[0] : pair[1];
+  /** Pick highest-intensity transit of given type. */
+  private bestTransitForBlock(transits: Transit[], type: string): Transit | null {
+    const candidates = transits
+      .filter(t => t.type === type)
+      .sort((a, b) => b.intensity - a.intensity);
+    return candidates[0] ?? null;
   }
 
-  private contextLine(context: string, start: string, rating: string): string {
-    const hour = parseInt(start, 10);
-    if (hour < 12) return `Strong ${context} energy this morning. Keep moving.`;
-    if (hour < 16) return `${rating === 'great' ? 'Momentum is building' : 'Stay focused'} — ${context} window is open.`;
-    return `${context === 'love' ? 'Connection flows' : 'Good flow'} in the ${hour < 18 ? 'late afternoon' : 'evening'}.`;
+  /** Trim transit description to max chars, removing verbose lead-in phrases. */
+  private trimTransit(desc: string, max: number): string {
+    let s = desc.trim();
+    // Remove common lead-in patterns
+    s = s.replace(/^(Emotional tone|Desire and|Words land|This aspect|The)/i, '').trimStart();
+    // Capitalise first letter
+    s = s.charAt(0).toUpperCase() + s.slice(1);
+    return s.length > max ? `${s.slice(0, max - 1).trim()}…` : s;
   }
 
-  private neutralLine(start: string, rating: string, context: string): string {
+  // ── Context-based fallback copy (when no matching transit) ───────────────
+
+  private peakBodyFromContext(context: string, rating: string, dashaLord: string): string {
+    const dashaBoost = ['Sun','Moon','Jupiter'].includes(dashaLord) ? ' Jupiter dasha amplifies.' : '';
     const lines: Record<string, string> = {
-      '06:00': `${rating === 'tense' ? 'Ease in slowly.' : 'Set your intention for the day.'}`,
-      '08:00': `${rating === 'great' ? 'First energy, best work.' : 'Tackle your most important task now.'}`,
-      '10:00': `${context === 'career' ? 'Keep the work momentum going.' : 'Late morning — stay with what matters.'}`,
-      '12:00': `${rating === 'tense' ? 'Rest if you can. Midday is heavy.' : 'Midday check — are you on track?'}`,
-      '14:00': `${rating === 'mixed' ? 'Steady the afternoon.' : 'Creative energy rises now.'}`,
-      '16:00': `${context === 'love' ? 'Good time to reconnect.' : 'Wrap up open tasks before evening.'}`,
-      '18:00': `${rating === 'great' ? 'Strong evening. Good for connection.' : 'Wind down and reflect.'}`,
-      '20:00': `${rating === 'tense' ? 'Rest fully. Tomorrow resets.' : 'Night window. Restore and prepare.'}`,
+      career: `Best window for decisive work${dashaBoost} Act on what matters most.`,
+      love:   `Heart energy is clearest now.${dashaBoost} Express what matters.`,
+      health: `Physical energy peaks here. Move your body now.`,
+      overall:`Peak hora — best window of the day. Move forward.`,
     };
-    return lines[start] ?? 'Stay present this hora.';
+    return lines[context] ?? lines.overall;
   }
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
+  private cautionBodyFromContext(context: string, rating: string, dashaLord: string): string {
+    const lines: Record<string, string> = {
+      career: `Avoid risky decisions or new commitments now.`,
+      love:   `Emotional sensitivity is high. Pause before reacting.`,
+      health: `Low physical energy. Rest is the right choice.`,
+      overall:`Low-energy hora. Conserve and observe.`,
+    };
+    return lines[context] ?? lines.overall;
+  }
+
+  private neutralBody(start: string, rating: string, context: string, dashaLord: string): string {
+    const hour = parseInt(start, 10);
+    if (hour < 8)  return rating === 'tense' ? 'Ease into the day gently.' : 'Set a clear intention before starting.';
+    if (hour < 12) return context === 'career' ? 'Focused work flows well now.' : 'Keep the morning energy steady.';
+    if (hour < 14) return rating === 'tense' ? 'Midday is heavy. Rest if possible.' : 'Check progress and adjust.';
+    if (hour < 18) return context === 'love' ? 'Afternoon is good for connection.' : 'Creative momentum builds now.';
+    if (hour < 20) return rating === 'great' ? 'Evening energy is strong. Use it.' : 'Wind down tasks and reflect.';
+    return rating === 'tense' ? 'Rest fully. Tomorrow the engine recalculates.' : 'Night hora. Restore and prepare.';
+  }
+
+  // ── Utility ────────────────────────────────────────────────────────────────
 
   private ratingFromScore(score: number): string {
     if (score >= 0.8) return 'great';
@@ -232,24 +274,18 @@ export class HourlyPredictionPushService {
 
   private lagnaEmoji(lagna: string): string {
     const map: Record<string, string> = {
-      Mesha: '♈', Vrishabha: '♉', Mithuna: '♊', Karka: '♋',
-      Simha: '♌', Kanya: '♍', Tula: '♎', Vrischika: '♏',
-      Dhanu: '♐', Makara: '♑', Kumbha: '♒', Meena: '♓',
+      Mesha:'♈', Vrishabha:'♉', Mithuna:'♊', Karka:'♋',
+      Simha:'♌', Kanya:'♍', Tula:'♎', Vrischika:'♏',
+      Dhanu:'♐', Makara:'♑', Kumbha:'♒', Meena:'♓',
     };
     return map[lagna] ?? '✦';
-  }
-
-  private nakshatraSign(nakshatra: string): string {
-    // Return short nakshatra abbreviation for titles
-    return nakshatra.split(' ')[0];
   }
 
   private blockStartingNow(local: { h: number; m: number }): Block | null {
     const nowMin = local.h * 60 + local.m;
     for (const b of ENGINE_BLOCKS) {
       const [bh, bm] = b.start.split(':').map(Number);
-      const bMin = bh * 60 + bm;
-      if (nowMin >= bMin && nowMin < bMin + 5) return b;
+      if (nowMin >= bh * 60 + bm && nowMin < bh * 60 + bm + 5) return b;
     }
     return null;
   }
@@ -268,7 +304,6 @@ export class HourlyPredictionPushService {
   }
 
   private startOfDay(utc: Date, tz: string): Date {
-    const key = this.localDateKey(utc, tz);
-    return new Date(`${key}T00:00:00Z`);
+    return new Date(`${this.localDateKey(utc, tz)}T00:00:00Z`);
   }
 }
