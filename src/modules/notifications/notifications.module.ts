@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { CalendarModule } from '../calendar/calendar.module';
 import { PredictionModule } from '../prediction/prediction.module';
+import { AiModule } from '../ai/ai.module';
+import { SubatimeModule } from '../subatime/subatime.module';
 import { NotificationDeliveryService } from './notification-delivery.service';
 import { HourlyPredictionPushService } from './hourly-prediction-push.service';
 import { NotificationPushDispatcherService } from './notification-push-dispatcher.service';
@@ -14,7 +16,7 @@ import { PushModule } from '../push/push.module';
 import { UserModule } from '../user/user.module';
 
 @Module({
-  imports: [PushModule, UserModule, CalendarModule, PredictionModule],
+  imports: [PushModule, UserModule, CalendarModule, PredictionModule, AiModule, SubatimeModule],
   controllers: [NotificationsController],
   providers: [
     NotificationsService,
