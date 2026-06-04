@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { PrismaModule } from '../../database/prisma.module';
 import { AstrologyModule } from '../astrology/astrology.module';
 import { AiModule } from '../ai/ai.module';
@@ -15,7 +15,7 @@ import { ScoringEngineService } from './services/scoring-engine.service';
     AiModule,
     BirthProfileModule,
     AstrologyModule,
-    NotificationsModule,
+    forwardRef(() => NotificationsModule),
   ],
   controllers: [PredictionController],
   providers: [DailyPredictionService, ScoringEngineService, FeedbackLearningService],

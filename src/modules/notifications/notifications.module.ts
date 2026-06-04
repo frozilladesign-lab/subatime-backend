@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { CalendarModule } from '../calendar/calendar.module';
 import { PredictionModule } from '../prediction/prediction.module';
 import { NotificationDeliveryService } from './notification-delivery.service';
@@ -14,7 +14,7 @@ import { PushModule } from '../push/push.module';
 import { UserModule } from '../user/user.module';
 
 @Module({
-  imports: [PushModule, UserModule, CalendarModule, PredictionModule],
+  imports: [PushModule, UserModule, CalendarModule, forwardRef(() => PredictionModule)],
   controllers: [NotificationsController],
   providers: [
     NotificationsService,
