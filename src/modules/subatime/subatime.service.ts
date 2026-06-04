@@ -36,6 +36,7 @@ import {
   type DreamStressBand,
 } from './dream-engine';
 import { WellnessSnapshotService } from '../user/wellness-snapshot.service';
+import { ScoringEngineService } from '../prediction/services/scoring-engine.service';
 
 type SubatimeDayRating = 'great' | 'good' | 'mixed' | 'tense';
 type WindowLabel = 'morning' | 'afternoon' | 'evening' | 'night';
@@ -52,6 +53,7 @@ export class SubatimeService {
     private readonly dreamExtraction: DreamExtractionService,
     private readonly wellnessSnapshots: WellnessSnapshotService,
     private readonly firebasePush: FirebasePushService,
+    private readonly scoringEngine: ScoringEngineService,
   ) {}
 
   /** Sends a test push to all device tokens for this user. Used to verify FCM pipeline. */
@@ -114,7 +116,20 @@ export class SubatimeService {
       return okResponse(null, 'Birth profile required to generate plan');
     }
     const base = this.toDayPayload(prediction, user?.name);
-    // Client-side i18n via `copy` — skip runtime Gemini Sinhala for plan/day.
+
+    // Re-derive transits with the request's lang so Sinhala users get Sinhala transit text.
+    if (normalizedLang === 'si' && prediction.transits) {
+      const siTransits = this.scoringEngine.deriveDailyTransits({
+        date:            targetDate,
+        userId,
+        onboardingIntent: prediction.meta?.lagna ? undefined : undefined,
+        lagna:           prediction.meta.lagna    ?? '',
+        nakshatra:       prediction.meta.nakshatra ?? '',
+        lang:            'si',
+      });
+      (base as Record<string, unknown>).transits = siTransits;
+    }
+
     setCachedPlanDayPayload(userId, dateIso, normalizedLang, base);
     return okResponse(base, 'Plan day fetched');
   }

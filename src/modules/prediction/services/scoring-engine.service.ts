@@ -167,13 +167,14 @@ export class ScoringEngineService {
     });
   }
 
-  /** Surface-level transit copy for Day Plan until ephemeris aspects are fully wired. */
+  /** Surface-level transit copy. Pass lang='si' to receive Sinhala title + description. */
   deriveDailyTransits(params: {
     date: Date;
     userId: string;
     onboardingIntent?: string | null;
     lagna: string;
     nakshatra: string;
+    lang?: string;
   }): DayTransitDto[] {
     return deriveDailyTransitsFromPool(params);
   }
