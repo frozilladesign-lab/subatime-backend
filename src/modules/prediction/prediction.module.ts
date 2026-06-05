@@ -19,6 +19,6 @@ import { ScoringEngineService } from './services/scoring-engine.service';
   ],
   controllers: [PredictionController],
   providers: [DailyPredictionService, ScoringEngineService, FeedbackLearningService],
-  exports: [DailyPredictionService, FeedbackLearningService, ScoringEngineService],
+  exports: [DailyPredictionService, FeedbackLearningService],
 })
 export class PredictionModule {}

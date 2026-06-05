@@ -36,7 +36,7 @@ import {
   type DreamStressBand,
 } from './dream-engine';
 import { WellnessSnapshotService } from '../user/wellness-snapshot.service';
-import { ScoringEngineService } from '../prediction/services/scoring-engine.service';
+import { deriveDailyTransitsFromPool } from '../prediction/services/day-transits';
 
 type SubatimeDayRating = 'great' | 'good' | 'mixed' | 'tense';
 type WindowLabel = 'morning' | 'afternoon' | 'evening' | 'night';
@@ -53,7 +53,6 @@ export class SubatimeService {
     private readonly dreamExtraction: DreamExtractionService,
     private readonly wellnessSnapshots: WellnessSnapshotService,
     private readonly firebasePush: FirebasePushService,
-    private readonly scoringEngine: ScoringEngineService,
   ) {}
 
   /** Sends a test push to all device tokens for this user. Used to verify FCM pipeline. */
@@ -118,13 +117,14 @@ export class SubatimeService {
     const base = this.toDayPayload(prediction, user?.name);
 
     // Re-derive transits with the request's lang so Sinhala users get Sinhala transit text.
-    if (normalizedLang === 'si' && prediction.transits) {
-      const siTransits = this.scoringEngine.deriveDailyTransits({
+    // Uses deriveDailyTransitsFromPool directly — no service injection needed.
+    if (normalizedLang === 'si') {
+      const siTransits = deriveDailyTransitsFromPool({
         date:            targetDate,
         userId,
-        onboardingIntent: prediction.meta?.lagna ? undefined : undefined,
-        lagna:           prediction.meta.lagna    ?? '',
-        nakshatra:       prediction.meta.nakshatra ?? '',
+        onboardingIntent: undefined,
+        lagna:           String(prediction.meta.lagna    ?? ''),
+        nakshatra:       String(prediction.meta.nakshatra ?? ''),
         lang:            'si',
       });
       (base as Record<string, unknown>).transits = siTransits;

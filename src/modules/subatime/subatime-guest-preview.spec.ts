@@ -34,7 +34,6 @@ describe('GET /api/subatime/public/preview/day (guest preview)', () => {
       {} as any,
       {} as any,
       {} as any,
-      {} as any,
     );
   };
 
@@ -73,7 +72,6 @@ describe('GET /api/subatime/public/preview/day (guest preview)', () => {
     } as unknown as DailyPredictionService;
     const service = new SubatimeService(
       daily,
-      {} as any,
       {} as any,
       {} as any,
       {} as any,
