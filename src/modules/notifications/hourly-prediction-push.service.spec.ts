@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { DailyPredictionService } from '../prediction/services/daily-prediction.service';
 import { FirebasePushService } from '../push/firebase-push.service';
@@ -7,6 +8,10 @@ import { HourlyPredictionPushService } from './hourly-prediction-push.service';
  * Phase 3 dedup: the hourly FCM block push is a FALLBACK. Users whose devices report a
  * fresh local schedule are skipped; stale users get FCM with wording taken verbatim
  * from the stored engine-built notificationCandidates (never composed here).
+ *
+ * Phase 4 dedup: block pushes claim a persistent NotificationJob row under the unique
+ * key (userId, date, candidateId, type) BEFORE sending, so the same block can never be
+ * pushed twice across restarts, duplicate cron ticks, or multiple instances.
  */
 
 /** 06:02 UTC — the 06:00 block is "starting now" for a UTC-timezone profile. */
@@ -19,6 +24,8 @@ const BLOCK_0600_CANDIDATE = {
   endTime: '08:00',
   score: 42,
   priority: 3,
+  category: 'avoid_time',
+  importance: 'high',
   title: '⚠️ Early Morning — Low-energy hora',
   titleSi: '⚠️ පුරා උදෑසන',
   body: 'Low-energy hora. Conserve and observe.',
@@ -28,11 +35,43 @@ const BLOCK_0600_CANDIDATE = {
   astroSource: { context: 'overall', confidenceScore: 0.6 },
 };
 
+/** Shared dedup store simulating the (userId, date, candidateId, type) unique index. */
+function makeNotificationJobMock(claimedKeys: Set<string>) {
+  const create = jest.fn((args: { data: Record<string, unknown> }) => {
+    const d = args.data;
+    const key = [d.userId, (d.date as Date)?.toISOString().slice(0, 10), d.candidateId, d.type].join(':');
+    if (claimedKeys.has(key)) {
+      return Promise.reject(
+        new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+          code: 'P2002',
+          clientVersion: 'test',
+        }),
+      );
+    }
+    claimedKeys.add(key);
+    return Promise.resolve({ id: `job-${claimedKeys.size}` });
+  });
+  const update = jest.fn((_args: { where: unknown; data: Record<string, unknown> }) =>
+    Promise.resolve({ id: 'job-updated' }),
+  );
+  return { create, update };
+}
+
 function makeService(opts: {
   localSchedules: unknown[];
   storedCandidates?: unknown;
+  pushSucceeds?: boolean;
+  claimedKeys?: Set<string>;
 }) {
-  const sendEachToTokens = jest.fn(() =>
+  const sendEachToTokens = opts.pushSucceeds === false
+    ? jest.fn(() =>
+        Promise.resolve({
+          successCount: 0,
+          failureCount: 1,
+          responses: [{ success: false, error: { code: 'messaging/internal-error' } }],
+        }),
+      )
+    : jest.fn(() =>
     Promise.resolve({
       successCount: 1,
       failureCount: 0,
@@ -51,6 +90,8 @@ function makeService(opts: {
         : { notificationCandidates: opts.storedCandidates },
     ),
   );
+  const claimedKeys = opts.claimedKeys ?? new Set<string>();
+  const notificationJob = makeNotificationJobMock(claimedKeys);
   const prisma = {
     user: {
       findMany: jest.fn(() =>
@@ -69,6 +110,7 @@ function makeService(opts: {
     dailyPrediction: {
       findUnique: dailyPredictionFindUnique,
     } as unknown as PrismaService['dailyPrediction'],
+    notificationJob: notificationJob as unknown as PrismaService['notificationJob'],
     userDeviceToken: {
       deleteMany: jest.fn(() => Promise.resolve({ count: 0 })),
     } as unknown as PrismaService['userDeviceToken'],
@@ -78,7 +120,14 @@ function makeService(opts: {
   const dailyPrediction = { generateForUser } as unknown as DailyPredictionService;
 
   const service = new HourlyPredictionPushService(prisma, dailyPrediction, push);
-  return { service, sendEachToTokens, dailyPredictionFindUnique, generateForUser };
+  return {
+    service,
+    sendEachToTokens,
+    dailyPredictionFindUnique,
+    generateForUser,
+    notificationJob,
+    claimedKeys,
+  };
 }
 
 const FRESH_SCHEDULE = {
@@ -160,5 +209,69 @@ describe('HourlyPredictionPushService (Phase 3 local-first dedup)', () => {
 
     expect(generateForUser).toHaveBeenCalled();
     expect(sendEachToTokens).not.toHaveBeenCalled();
+  });
+});
+
+describe('HourlyPredictionPushService (Phase 4 persistent DB dedup)', () => {
+  it('claims a NotificationJob row before sending FCM', async () => {
+    const { service, sendEachToTokens, notificationJob } = makeService({
+      localSchedules: [],
+      storedCandidates: STORED,
+    });
+
+    await service.sendBlockNotifications(NOW);
+
+    expect(notificationJob.create).toHaveBeenCalledTimes(1);
+    const created = (notificationJob.create.mock.calls[0][0] as { data: Record<string, unknown> }).data;
+    expect(created.type).toBe('prediction_block_fallback');
+    expect(created.candidateId).toBe('block-0600');
+    expect(created.status).toBe('sent'); // delivered inline — dispatcher only polls pending
+    expect((created.date as Date).toISOString().slice(0, 10)).toBe('2026-07-04');
+    expect(sendEachToTokens).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips FCM when the dedup key is already claimed (restart / second cron tick / other instance)', async () => {
+    // Pre-claim the exact key this run would use.
+    const claimedKeys = new Set<string>([
+      ['user-1', '2026-07-04', 'block-0600', 'prediction_block_fallback'].join(':'),
+    ]);
+    const { service, sendEachToTokens, notificationJob } = makeService({
+      localSchedules: [],
+      storedCandidates: STORED,
+      claimedKeys,
+    });
+
+    await service.sendBlockNotifications(NOW);
+
+    expect(notificationJob.create).toHaveBeenCalledTimes(1); // attempted…
+    expect(sendEachToTokens).not.toHaveBeenCalled(); // …but P2002 → no send
+  });
+
+  it('two runs in the same block window send exactly once (persistent across ticks)', async () => {
+    const claimedKeys = new Set<string>();
+    const first = makeService({ localSchedules: [], storedCandidates: STORED, claimedKeys });
+    await first.service.sendBlockNotifications(NOW);
+    expect(first.sendEachToTokens).toHaveBeenCalledTimes(1);
+
+    // Second tick (e.g. after a deploy) reuses the shared dedup store.
+    const second = makeService({ localSchedules: [], storedCandidates: STORED, claimedKeys });
+    await second.service.sendBlockNotifications(NOW);
+    expect(second.sendEachToTokens).not.toHaveBeenCalled();
+  });
+
+  it('marks the job failed (and does not resend) when FCM delivery fails', async () => {
+    const { service, sendEachToTokens, notificationJob } = makeService({
+      localSchedules: [],
+      storedCandidates: STORED,
+      pushSucceeds: false,
+    });
+
+    await service.sendBlockNotifications(NOW);
+
+    expect(sendEachToTokens).toHaveBeenCalledTimes(1);
+    expect(notificationJob.update).toHaveBeenCalledTimes(1);
+    const upd = (notificationJob.update.mock.calls[0][0] as { data: Record<string, unknown> }).data;
+    expect(upd.status).toBe('failed');
+    expect((upd.payload as Record<string, unknown>).error).toBe('fcm_all_tokens_failed');
   });
 });

@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
+import { NotificationType, Prisma } from '@prisma/client';
 import type { BlockNotificationCandidate, NotificationCandidates } from '@subatime/jyotisha-engine';
 import { PrismaService } from '../../database/prisma.service';
 import { DailyPredictionService } from '../prediction/services/daily-prediction.service';
@@ -34,11 +35,20 @@ const ENGINE_BLOCKS: Block[] = [
  * (`skipped_local_schedule_fresh`) so recently active users never get local + FCM
  * duplicates; stale/missing/denied-permission users still get the FCM fallback
  * (`sent_fcm_fallback`).
+ *
+ * Dedup is PERSISTENT (Phase 4): before sending, a `NotificationJob` row with type
+ * `prediction_block_fallback` is created under the unique key
+ * (userId, date, candidateId, type) — the candidate id encodes category, window, and
+ * kind. A unique-constraint hit means another instance/tick/restart already handled it
+ * (`skipped_already_sent_or_queued`). Rows are created as `sent` (delivered inline right
+ * after) so the NotificationJob dispatcher — which only polls `pending` — never
+ * double-sends them; FCM failures downgrade the row to `failed` with error metadata,
+ * and there is deliberately NO automatic retry of the same candidate.
+ * No delivery correctness depends on process memory.
  */
 @Injectable()
 export class HourlyPredictionPushService {
   private readonly logger = new Logger(HourlyPredictionPushService.name);
-  private readonly _sent = new Set<string>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -83,14 +93,11 @@ export class HourlyPredictionPushService {
         const block = this.blockStartingNow(local);
         if (!block) continue;
 
-        const dateKey  = this.localDateKey(now, tz);
-        const dedupKey = `${user.id}:${block.start}:${dateKey}`;
-        if (this._sent.has(dedupKey)) continue;
+        const dateKey = this.localDateKey(now, tz);
 
         // Local-first dedup: a device with a fresh local schedule already shows this
-        // block's notification locally — skip the FCM copy for this block entirely.
+        // block's notification locally — skip the FCM copy before touching the DB.
         if (anyLocalScheduleFresh(user.localNotificationSchedules, now)) {
-          this._sent.add(dedupKey);
           this.logger.log(
             `[${block.label}] ${user.name ?? user.id.slice(0, 8)}: skipped_local_schedule_fresh`,
           );
@@ -99,6 +106,16 @@ export class HourlyPredictionPushService {
 
         const candidate = await this.blockCandidateFor(user.id, now, tz, block.start);
         if (!candidate) continue;
+
+        // Persistent dedup: claim the (userId, date, candidateId, type) key BEFORE
+        // sending. Safe across restarts, duplicate cron ticks, and multiple instances.
+        const job = await this.claimBlockFallbackJob(user.id, dateKey, candidate, now);
+        if (!job) {
+          this.logger.log(
+            `[${block.label}] ${user.name ?? user.id.slice(0, 8)}: skipped_already_sent_or_queued`,
+          );
+          continue;
+        }
 
         const tokens = user.deviceTokens.map(t => t.token);
         const result = await this.push.sendEachToTokens({
@@ -117,8 +134,21 @@ export class HourlyPredictionPushService {
 
         if (result.successCount > 0) {
           sent += result.successCount;
-          this._sent.add(dedupKey);
           this.logger.log(`[${block.label}] ${user.name ?? user.id.slice(0,8)}: sent_fcm_fallback "${candidate.title}" | "${candidate.body.slice(0,50)}"`);
+        } else {
+          // Keep the dedup row (no accidental resends) but record the failure.
+          await this.prisma.notificationJob.update({
+            where: { id: job.id },
+            data: {
+              status: 'failed',
+              payload: {
+                title: candidate.title,
+                body: candidate.body,
+                candidateId: candidate.id,
+                error: 'fcm_all_tokens_failed',
+              },
+            },
+          }).catch(() => {});
         }
 
         result.responses.forEach((r, i) => {
@@ -169,6 +199,45 @@ export class HourlyPredictionPushService {
       return null;
     }
     return candidate;
+  }
+
+  /**
+   * Claims the persistent dedup key by inserting the NotificationJob row (status `sent`,
+   * delivered inline immediately after — the dispatcher only polls `pending`). Returns
+   * null when the unique constraint reports the key as already claimed.
+   */
+  private async claimBlockFallbackJob(
+    userId: string,
+    dateKey: string,
+    candidate: BlockNotificationCandidate,
+    now: Date,
+  ): Promise<{ id: string } | null> {
+    try {
+      return await this.prisma.notificationJob.create({
+        data: {
+          userId,
+          type: NotificationType.prediction_block_fallback,
+          scheduledAt: now,
+          status: 'sent',
+          date: new Date(`${dateKey}T00:00:00.000Z`),
+          candidateId: candidate.id,
+          payload: {
+            title: candidate.title,
+            body: candidate.body,
+            candidateId: candidate.id,
+            category: candidate.category ?? null,
+            importance: candidate.importance ?? null,
+            blockStart: candidate.startTime,
+          },
+        },
+        select: { id: true },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        return null;
+      }
+      throw e;
+    }
   }
 
   private parseCandidates(raw: unknown): NotificationCandidates | null {

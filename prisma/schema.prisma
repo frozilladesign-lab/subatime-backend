@@ -27,6 +27,8 @@ enum NotificationType {
   warning
   event
   proactive_hora
+  /// Hourly block-push FCM fallback (dedup rows; delivered inline, never by the dispatcher).
+  prediction_block_fallback
 }
 
 enum NotificationStatus {
@@ -273,6 +275,12 @@ model NotificationJob {
   payload          Json
   scheduledAt      DateTime
   status           NotificationStatus  @default(pending)
+  /// Prediction day (local date key) for block-fallback dedup rows; null on legacy job types.
+  date             DateTime?           @db.Date
+  /// Engine candidate id (e.g. block-1400) — encodes category + window + type. Part of the
+  /// persistent dedup key so the same block can never be pushed twice across restarts,
+  /// duplicate cron ticks, or multiple backend instances.
+  candidateId      String?
   /// In-app read state (push delivery uses NotificationLog separately).
   isRead           Boolean             @default(false)
   createdAt        DateTime            @default(now())
@@ -283,6 +291,7 @@ model NotificationJob {
   @@index([userId, scheduledAt])
   @@index([status, scheduledAt])
   @@unique([userId, type, scheduledAt])
+  @@unique([userId, date, candidateId, type])
   @@map("notification_jobs")
 }
 
