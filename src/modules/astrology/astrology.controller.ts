@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
 import { CurrentUserId } from '../../common/decorators/current-user-id.decorator';
 import { AuthGuard } from '../../common/guards/auth.guard';
 import { AstrologyService } from './astrology.service';
@@ -18,10 +18,4 @@ export class AstrologyController {
   chartMe(@CurrentUserId() userId: string) {
     return this.astrologyService.getLatestChart(userId);
   }
-
-  @Get('chart/:userId')
-  getChart(@Param('userId') userId: string) {
-    return this.astrologyService.getLatestChart(userId);
-  }
-
 }

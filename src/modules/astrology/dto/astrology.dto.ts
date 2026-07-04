@@ -5,19 +5,19 @@ export class GenerateChartDto {
   @IsString()
   userId?: string;
 
-  @ValidateIf((o) => !o.userId?.trim())
+  @ValidateIf((o: GenerateChartDto) => !o.userId?.trim())
   @IsString()
   fullName!: string;
 
-  @ValidateIf((o) => !o.userId?.trim())
+  @ValidateIf((o: GenerateChartDto) => !o.userId?.trim())
   @IsString()
   birthDate!: string;
 
-  @ValidateIf((o) => !o.userId?.trim())
+  @ValidateIf((o: GenerateChartDto) => !o.userId?.trim())
   @IsString()
   birthTime!: string;
 
-  @ValidateIf((o) => !o.userId?.trim())
+  @ValidateIf((o: GenerateChartDto) => !o.userId?.trim())
   @IsString()
   birthPlace!: string;
 

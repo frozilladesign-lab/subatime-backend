@@ -1,10 +1,9 @@
-import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Post, UseGuards } from '@nestjs/common';
 import { CurrentUserId } from '../../common/decorators/current-user-id.decorator';
 import { AuthGuard } from '../../common/guards/auth.guard';
 import {
   AdminSendNotificationDto,
-  NotificationLogsQueryDto,
-  RegisterDeviceDto,
+  ReportLocalScheduleDto,
   ScheduleNotificationDto,
 } from './dto/notifications.dto';
 import { NotificationsService } from './notifications.service';
@@ -19,21 +18,17 @@ export class NotificationsController {
     return this.notificationsService.schedule(dto);
   }
 
+  /** App reports its local block-notification schedule AFTER scheduling succeeds. */
+  @Post('local-schedule')
+  reportLocalSchedule(
+    @CurrentUserId() userId: string,
+    @Body() dto: ReportLocalScheduleDto,
+  ) {
+    return this.notificationsService.reportLocalSchedule(userId, dto);
+  }
+
   @Post('admin/send')
   adminSend(@Body() dto: AdminSendNotificationDto) {
     return this.notificationsService.adminSend(dto);
-  }
-
-  @Post('register-device')
-  registerDevice(@Body() dto: RegisterDeviceDto) {
-    return this.notificationsService.registerDevice(dto);
-  }
-
-  @Get('logs')
-  logs(
-    @CurrentUserId() userId: string,
-    @Query() query: NotificationLogsQueryDto,
-  ) {
-    return this.notificationsService.getLogs(userId, query);
   }
 }

@@ -2,7 +2,7 @@ import { Transform } from 'class-transformer';
 import { IsEmail, IsOptional, IsString, MinLength } from 'class-validator';
 
 export class RegisterDto {
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @IsEmail()
   email!: string;
 
@@ -18,7 +18,7 @@ export class RegisterDto {
 }
 
 export class LoginDto {
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @IsEmail()
   email!: string;
 

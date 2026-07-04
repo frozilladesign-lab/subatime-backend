@@ -1,9 +1,15 @@
+import type { ExecutionContext } from '@nestjs/common';
 import { UnauthorizedException } from '@nestjs/common';
+import { scryptSync } from 'crypto';
 import { AuthGuard } from '../../common/guards/auth.guard';
 import { AuthConfig } from './auth.config';
 import { AuthService } from './auth.service';
 import { JwtTokenService } from './jwt-token.service';
 import { SessionService } from './session.service';
+import { PrismaService } from '../../database/prisma.service';
+
+/** Minimal structural mock — only the Prisma surface `AuthService`/`SessionService` call. */
+type MockedPrisma = Pick<PrismaService, 'user' | 'userSession'>;
 
 describe('JwtTokenService', () => {
   const config = {
@@ -29,14 +35,14 @@ describe('AuthGuard', () => {
   const jwt = new JwtTokenService(config);
   const guard = new AuthGuard(jwt);
 
-  const ctx = (authorization?: string) =>
+  const ctx = (authorization?: string): ExecutionContext =>
     ({
       switchToHttp: () => ({
         getRequest: () => ({
           headers: authorization ? { authorization } : {},
         }),
       }),
-    }) as any;
+    }) as unknown as ExecutionContext;
 
   it('accepts valid JWT bearer tokens', () => {
     const { token } = jwt.signAccessToken('user-abc');
@@ -62,21 +68,28 @@ describe('AuthService', () => {
 
   const jwt = new JwtTokenService(config);
 
-  const prisma = {
+  const userFindUnique = jest.fn<Promise<unknown>, unknown[]>();
+  const userCreate = jest.fn<Promise<unknown>, unknown[]>();
+  const userUpdate = jest.fn<Promise<unknown>, unknown[]>();
+  const sessionCreate = jest.fn<Promise<unknown>, unknown[]>();
+  const sessionFindFirst = jest.fn<Promise<unknown>, unknown[]>();
+  const sessionUpdate = jest.fn<Promise<unknown>, unknown[]>();
+
+  const prisma: MockedPrisma = {
     user: {
-      findUnique: jest.fn(),
-      create: jest.fn(),
-      update: jest.fn(),
-    },
+      findUnique: userFindUnique,
+      create: userCreate,
+      update: userUpdate,
+    } as unknown as PrismaService['user'],
     userSession: {
-      create: jest.fn(),
-      findFirst: jest.fn(),
-      update: jest.fn(),
-    },
+      create: sessionCreate,
+      findFirst: sessionFindFirst,
+      update: sessionUpdate,
+    } as unknown as PrismaService['userSession'],
   };
 
-  const sessions = new SessionService(prisma as any, config);
-  const auth = new AuthService(prisma as any, jwt, sessions);
+  const sessions = new SessionService(prisma as PrismaService, config);
+  const auth = new AuthService(prisma as PrismaService, jwt, sessions);
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -84,14 +97,14 @@ describe('AuthService', () => {
 
   it('login returns JWT access and refresh tokens', async () => {
     const salt = 'abc';
-    const derived = require('crypto').scryptSync('secret12', salt, 64).toString('hex');
-    prisma.user.findUnique.mockResolvedValue({
+    const derived = scryptSync('secret12', salt, 64).toString('hex');
+    userFindUnique.mockResolvedValue({
       id: 'u1',
       email: 'a@b.com',
       name: 'A',
       passwordHash: `${salt}:${derived}`,
     });
-    prisma.userSession.create.mockResolvedValue({ id: 's1' });
+    sessionCreate.mockResolvedValue({ id: 's1' });
 
     const res = await auth.login({ email: 'a@b.com', password: 'secret12' });
     const data = res.data as Record<string, unknown>;
@@ -105,7 +118,7 @@ describe('AuthService', () => {
   it('refresh rotates session and returns new tokens', async () => {
     const raw = 'raw-refresh-token-value-32chars-xx';
     const hash = sessions.hashRefreshToken(raw);
-    prisma.userSession.findFirst.mockResolvedValue({
+    sessionFindFirst.mockResolvedValue({
       id: 's1',
       userId: 'u1',
       refreshTokenHash: hash,
@@ -113,20 +126,20 @@ describe('AuthService', () => {
       expiresAt: new Date(Date.now() + 60_000),
       revokedAt: null,
     });
-    prisma.userSession.update.mockResolvedValue({});
-    prisma.userSession.create.mockResolvedValue({ id: 's2' });
+    sessionUpdate.mockResolvedValue({});
+    sessionCreate.mockResolvedValue({ id: 's2' });
 
     const res = await auth.refresh({ refreshToken: raw });
     const data = res.data as Record<string, unknown>;
     expect(data.accessToken).toEqual(expect.any(String));
     expect(data.refreshToken).toEqual(expect.any(String));
-    expect(prisma.userSession.update).toHaveBeenCalled();
+    expect(sessionUpdate).toHaveBeenCalled();
   });
 
   it('logout revokes refresh session', async () => {
     const raw = 'raw-refresh-token-value-32chars-xy';
     const hash = sessions.hashRefreshToken(raw);
-    prisma.userSession.findFirst.mockResolvedValue({
+    sessionFindFirst.mockResolvedValue({
       id: 's1',
       userId: 'u1',
       refreshTokenHash: hash,
@@ -134,13 +147,13 @@ describe('AuthService', () => {
       expiresAt: new Date(Date.now() + 60_000),
       revokedAt: null,
     });
-    prisma.userSession.update.mockResolvedValue({});
+    sessionUpdate.mockResolvedValue({});
 
     await auth.logout({ refreshToken: raw });
-    expect(prisma.userSession.update).toHaveBeenCalledWith(
+    expect(sessionUpdate).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: 's1' },
-        data: expect.objectContaining({ revokedAt: expect.any(Date) }),
+        data: expect.objectContaining({ revokedAt: expect.any(Date) as Date }) as Record<string, unknown>,
       }),
     );
   });

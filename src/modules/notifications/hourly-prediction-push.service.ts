@@ -1,11 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
+import type { BlockNotificationCandidate, NotificationCandidates } from '@subatime/jyotisha-engine';
 import { PrismaService } from '../../database/prisma.service';
 import { DailyPredictionService } from '../prediction/services/daily-prediction.service';
 import { FirebasePushService, isUnregisteredFcmError } from '../push/firebase-push.service';
+import { anyLocalScheduleFresh } from './local-schedule-freshness';
 
 type Block = { start: string; end: string; label: string };
-type Transit = { id: string; type: string; title: string; description: string; intensity: number };
 
 const ENGINE_BLOCKS: Block[] = [
   { start: '06:00', end: '08:00', label: 'Early Morning' },
@@ -19,12 +20,20 @@ const ENGINE_BLOCKS: Block[] = [
 ];
 
 /**
- * Accurate block notifications — content sourced directly from prediction engine:
- *   - goodTimes / badTimes → which block is peak/caution
- *   - transits → the ACTUAL planetary events driving the day's energy
- *   - summary → contains specific best-window timing from the engine
- *   - dominantContext + confidenceScore → personalises the message tone
- *   - Sade Sati / Jupiter transit meta → adds astrological accuracy
+ * Block-start push notifications.
+ *
+ * Delivery-only: this service decides WHEN a push goes out (block boundary in the user's
+ * timezone, dedup, mute preferences, token hygiene). The WHAT — title/body wording — comes
+ * exclusively from the stored `DailyPrediction.notificationCandidates` built by the engine's
+ * `buildNotificationCandidates`, so FCM pushes, local notifications, and the Guide tab can
+ * never disagree about a block's message.
+ *
+ * FCM here is a FALLBACK: the app schedules the same block candidates as local
+ * notifications and reports that state (`UserLocalNotificationSchedule`). When any of the
+ * user's devices has a fresh local schedule, this push is skipped
+ * (`skipped_local_schedule_fresh`) so recently active users never get local + FCM
+ * duplicates; stale/missing/denied-permission users still get the FCM fallback
+ * (`sent_fcm_fallback`).
  */
 @Injectable()
 export class HourlyPredictionPushService {
@@ -38,11 +47,9 @@ export class HourlyPredictionPushService {
   ) {}
 
   @Cron('*/5 * * * *')
-  async sendBlockNotifications(): Promise<void> {
+  async sendBlockNotifications(now: Date = new Date()): Promise<void> {
     if (process.env.DISABLE_HOURLY_PREDICTION_PUSH === 'true') return;
     if (!this.push.isReady()) return;
-
-    const now = new Date();
 
     const users = await this.prisma.user.findMany({
       where: { deviceTokens: { some: {} }, birthProfile: { isNot: null } },
@@ -52,6 +59,14 @@ export class HourlyPredictionPushService {
         preferences: true,
         birthProfile: { select: { timezone: true } },
         deviceTokens: { select: { token: true } },
+        localNotificationSchedules: {
+          select: {
+            lastLocalScheduleAt: true,
+            localScheduleThroughDate: true,
+            deviceTimezone: true,
+            notificationPermissionStatus: true,
+          },
+        },
       },
     });
 
@@ -72,64 +87,38 @@ export class HourlyPredictionPushService {
         const dedupKey = `${user.id}:${block.start}:${dateKey}`;
         if (this._sent.has(dedupKey)) continue;
 
-        // ── Get stored prediction (has transits, goodTimes, badTimes, meta) ──
-        const storedPred = await this.prisma.dailyPrediction.findUnique({
-          where: { userId_date: { userId: user.id, date: this.startOfDay(now, tz) } },
-          select: {
-            goodTimes: true, badTimes: true, transits: true,
-            summary: true, confidenceScore: true, dominantContext: true,
-            scoreSpread: true,
-          },
-        });
+        // Local-first dedup: a device with a fresh local schedule already shows this
+        // block's notification locally — skip the FCM copy for this block entirely.
+        if (anyLocalScheduleFresh(user.localNotificationSchedules, now)) {
+          this._sent.add(dedupKey);
+          this.logger.log(
+            `[${block.label}] ${user.name ?? user.id.slice(0, 8)}: skipped_local_schedule_fresh`,
+          );
+          continue;
+        }
 
-        // Generate if missing
-        const output = storedPred ?? await this.dailyPrediction.generateForUser(user.id, now);
-        if (!output) continue;
-
-        const goodTimes = (storedPred?.goodTimes ?? (output as any).goodTimes ?? []) as Block[];
-        const badTimes  = (storedPred?.badTimes  ?? (output as any).badTimes  ?? []) as Block[];
-        const transits  = (storedPred?.transits  ?? (output as any).transits  ?? []) as Transit[];
-        const summary   = storedPred?.summary ?? (output as any).summary ?? '';
-        const confidence = storedPred?.confidenceScore ?? (output as any).confidenceScore ?? 0.5;
-        const context    = storedPred?.dominantContext ?? (output as any).personalization?.mostRelevantContext ?? 'overall';
-
-        // Fetch meta for Sade Sati / Jupiter transit accuracy
-        const chart = await this.prisma.astrologyChart.findFirst({
-          where: { birthProfile: { userId: user.id } },
-          orderBy: { version: 'desc' },
-          select: { chartData: true },
-        });
-        const chartData = chart?.chartData as Record<string, unknown> | undefined;
-        const lagna      = String(chartData?.lagna ?? '');
-        const nakshatra  = String(chartData?.nakshatra ?? '');
-        const dasha      = chartData?.dasha as Record<string, unknown> | undefined;
-        const dashaLord  = String(dasha?.current ?? '');
-        const antaraLord = String(dasha?.antara  ?? '');
-
-        const isPeak1   = goodTimes[0]?.start === block.start;
-        const isPeak2   = goodTimes[1]?.start === block.start;
-        const isCaution = badTimes[0]?.start  === block.start;
-        const isWeak    = badTimes[1]?.start  === block.start;
-
-        const content = this.buildContent({
-          block, isPeak1, isPeak2, isCaution, isWeak,
-          goodTimes, badTimes, transits, summary,
-          confidence, context, lagna, nakshatra,
-          dashaLord, antaraLord,
-        });
+        const candidate = await this.blockCandidateFor(user.id, now, tz, block.start);
+        if (!candidate) continue;
 
         const tokens = user.deviceTokens.map(t => t.token);
         const result = await this.push.sendEachToTokens({
           tokens,
-          title: content.title,
-          body:  content.body,
-          data: { type: 'feed', alertType: 'BLOCK_START', blockLabel: block.label, planDate: dateKey },
+          title: candidate.title,
+          body:  candidate.body,
+          data: {
+            type: 'feed',
+            alertType: 'BLOCK_START',
+            blockLabel: block.label,
+            planDate: dateKey,
+            candidateId: candidate.id,
+            deepLink: candidate.deepLink,
+          },
         });
 
         if (result.successCount > 0) {
           sent += result.successCount;
           this._sent.add(dedupKey);
-          this.logger.log(`[${block.label}] ${user.name ?? user.id.slice(0,8)}: "${content.title}" | "${content.body.slice(0,50)}"`);
+          this.logger.log(`[${block.label}] ${user.name ?? user.id.slice(0,8)}: sent_fcm_fallback "${candidate.title}" | "${candidate.body.slice(0,50)}"`);
         }
 
         result.responses.forEach((r, i) => {
@@ -145,141 +134,41 @@ export class HourlyPredictionPushService {
     if (sent > 0) this.logger.log(`BlockPush total: ${sent} sent`);
   }
 
-  // ── Accurate content from engine data ────────────────────────────────────
+  /**
+   * Stored engine-built candidate for the block starting now. Regenerates the prediction when
+   * the stored row is missing or predates the notification-candidates refactor — never
+   * composes copy locally.
+   */
+  private async blockCandidateFor(
+    userId: string,
+    now: Date,
+    tz: string,
+    blockStart: string,
+  ): Promise<BlockNotificationCandidate | null> {
+    const storedPred = await this.prisma.dailyPrediction.findUnique({
+      where: { userId_date: { userId, date: this.startOfDay(now, tz) } },
+      select: { notificationCandidates: true },
+    });
 
-  private buildContent(p: {
-    block: Block;
-    isPeak1: boolean; isPeak2: boolean; isCaution: boolean; isWeak: boolean;
-    goodTimes: Block[]; badTimes: Block[]; transits: Transit[];
-    summary: string; confidence: number; context: string;
-    lagna: string; nakshatra: string; dashaLord: string; antaraLord: string;
-  }): { title: string; body: string } {
-    const emoji  = this.lagnaEmoji(p.lagna);
-    const rating = this.ratingFromScore(p.confidence);
-
-    // ── PEAK HORA — actual best window from engine ──────────────────────────
-    if (p.isPeak1) {
-      // Find best matching transit for this block (opportunity type first)
-      const transit = this.bestTransitForBlock(p.transits, 'opportunity') ??
-                      this.bestTransitForBlock(p.transits, 'neutral');
-      const body = transit
-        ? this.trimTransit(transit.description, 90)
-        : this.peakBodyFromContext(p.context, rating, p.dashaLord);
-      return {
-        title: `${emoji} ${p.block.label} — ✨ Peak hora`,
-        body,
-      };
+    let candidates = this.parseCandidates(storedPred?.notificationCandidates);
+    if (!candidates) {
+      // generateForUser treats rows without candidates as stale and rebuilds them.
+      const generated = await this.dailyPrediction.generateForUser(userId, now);
+      candidates = generated?.notificationCandidates ?? null;
     }
+    if (!candidates) return null;
 
-    // ── SECOND BEST ────────────────────────────────────────────────────────
-    if (p.isPeak2) {
-      const transit = this.bestTransitForBlock(p.transits, 'opportunity');
-      return {
-        title: `✦ ${p.block.label} — Strong window`,
-        body: transit
-          ? this.trimTransit(transit.description, 90)
-          : `Good ${p.context} energy. Keep steady momentum.`,
-      };
-    }
-
-    // ── CAUTION HORA — actual worst window from engine ──────────────────────
-    if (p.isCaution) {
-      // Use challenge transit description for body — it explains WHY
-      const transit = this.bestTransitForBlock(p.transits, 'challenge');
-      const body = transit
-        ? this.trimTransit(transit.description, 90)
-        : this.cautionBodyFromContext(p.context, rating, p.dashaLord);
-      return {
-        title: `⚠️ ${p.block.label} — Low-energy hora`,
-        body,
-      };
-    }
-
-    // ── WEAK BLOCK ──────────────────────────────────────────────────────────
-    if (p.isWeak) {
-      return {
-        title: `· ${p.block.label} — Go gently`,
-        body: `${rating === 'tense' ? 'Conserve energy.' : 'Lighter tasks serve you better now.'}`,
-      };
-    }
-
-    // ── NEUTRAL — time + rating + dasha lord ────────────────────────────────
-    return {
-      title: `· ${p.block.label}`,
-      body:  this.neutralBody(p.block.start, rating, p.context, p.dashaLord),
-    };
+    return candidates.blocks.find((b) => b.startTime === blockStart) ?? null;
   }
 
-  // ── Transit helpers ────────────────────────────────────────────────────────
-
-  /** Pick highest-intensity transit of given type. */
-  private bestTransitForBlock(transits: Transit[], type: string): Transit | null {
-    const candidates = transits
-      .filter(t => t.type === type)
-      .sort((a, b) => b.intensity - a.intensity);
-    return candidates[0] ?? null;
-  }
-
-  /** Trim transit description to max chars, removing verbose lead-in phrases. */
-  private trimTransit(desc: string, max: number): string {
-    let s = desc.trim();
-    // Remove common lead-in patterns
-    s = s.replace(/^(Emotional tone|Desire and|Words land|This aspect|The)/i, '').trimStart();
-    // Capitalise first letter
-    s = s.charAt(0).toUpperCase() + s.slice(1);
-    return s.length > max ? `${s.slice(0, max - 1).trim()}…` : s;
-  }
-
-  // ── Context-based fallback copy (when no matching transit) ───────────────
-
-  private peakBodyFromContext(context: string, rating: string, dashaLord: string): string {
-    const dashaBoost = ['Sun','Moon','Jupiter'].includes(dashaLord) ? ' Jupiter dasha amplifies.' : '';
-    const lines: Record<string, string> = {
-      career: `Best window for decisive work${dashaBoost} Act on what matters most.`,
-      love:   `Heart energy is clearest now.${dashaBoost} Express what matters.`,
-      health: `Physical energy peaks here. Move your body now.`,
-      overall:`Peak hora — best window of the day. Move forward.`,
-    };
-    return lines[context] ?? lines.overall;
-  }
-
-  private cautionBodyFromContext(context: string, rating: string, dashaLord: string): string {
-    const lines: Record<string, string> = {
-      career: `Avoid risky decisions or new commitments now.`,
-      love:   `Emotional sensitivity is high. Pause before reacting.`,
-      health: `Low physical energy. Rest is the right choice.`,
-      overall:`Low-energy hora. Conserve and observe.`,
-    };
-    return lines[context] ?? lines.overall;
-  }
-
-  private neutralBody(start: string, rating: string, context: string, dashaLord: string): string {
-    const hour = parseInt(start, 10);
-    if (hour < 8)  return rating === 'tense' ? 'Ease into the day gently.' : 'Set a clear intention before starting.';
-    if (hour < 12) return context === 'career' ? 'Focused work flows well now.' : 'Keep the morning energy steady.';
-    if (hour < 14) return rating === 'tense' ? 'Midday is heavy. Rest if possible.' : 'Check progress and adjust.';
-    if (hour < 18) return context === 'love' ? 'Afternoon is good for connection.' : 'Creative momentum builds now.';
-    if (hour < 20) return rating === 'great' ? 'Evening energy is strong. Use it.' : 'Wind down tasks and reflect.';
-    return rating === 'tense' ? 'Rest fully. Tomorrow the engine recalculates.' : 'Night hora. Restore and prepare.';
+  private parseCandidates(raw: unknown): NotificationCandidates | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const o = raw as Record<string, unknown>;
+    if (!Array.isArray(o.blocks)) return null;
+    return raw as NotificationCandidates;
   }
 
   // ── Utility ────────────────────────────────────────────────────────────────
-
-  private ratingFromScore(score: number): string {
-    if (score >= 0.8) return 'great';
-    if (score >= 0.65) return 'good';
-    if (score >= 0.5) return 'mixed';
-    return 'tense';
-  }
-
-  private lagnaEmoji(lagna: string): string {
-    const map: Record<string, string> = {
-      Mesha:'♈', Vrishabha:'♉', Mithuna:'♊', Karka:'♋',
-      Simha:'♌', Kanya:'♍', Tula:'♎', Vrischika:'♏',
-      Dhanu:'♐', Makara:'♑', Kumbha:'♒', Meena:'♓',
-    };
-    return map[lagna] ?? '✦';
-  }
 
   private blockStartingNow(local: { h: number; m: number }): Block | null {
     const nowMin = local.h * 60 + local.m;

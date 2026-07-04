@@ -1,0 +1,82 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`MatchingService.compare regression baseline falls back to zodiacSign-only input 1`] = `
+{
+  "data": {
+    "breakdown": {
+      "communication": 62,
+      "emotional": 72,
+      "intimacy": 88,
+      "longTerm": 66,
+    },
+    "doshaFlags": {
+      "aManglik": false,
+      "bManglik": false,
+      "hasManglikMismatch": false,
+    },
+    "method": "heuristic",
+    "recommendations": [
+      "Prioritize weekly check-ins to improve communication quality.",
+      "Align long-term goals before major commitments.",
+      "No critical dosha clash detected in current profile inputs.",
+    ],
+    "score": 72,
+    "summary": "Moderate compatibility with areas to strengthen.",
+  },
+  "message": "Matching completed",
+}
+`;
+
+exports[`MatchingService.compare regression baseline matching pair (same moon sign, same nakshatra letter, manglik mismatch) 1`] = `
+{
+  "data": {
+    "breakdown": {
+      "communication": 82,
+      "emotional": 90,
+      "intimacy": 86,
+      "longTerm": 86,
+    },
+    "doshaFlags": {
+      "aManglik": true,
+      "bManglik": false,
+      "hasManglikMismatch": true,
+    },
+    "method": "heuristic",
+    "recommendations": [
+      "Maintain transparent communication habits.",
+      "Your long-term direction appears naturally aligned.",
+      "Consider guided counseling for Mars-driven conflict patterns.",
+    ],
+    "score": 86,
+    "summary": "Strong compatibility with aligned growth patterns.",
+  },
+  "message": "Matching completed",
+}
+`;
+
+exports[`MatchingService.compare regression baseline mismatched pair (different signs, no manglik mismatch) 1`] = `
+{
+  "data": {
+    "breakdown": {
+      "communication": 62,
+      "emotional": 72,
+      "intimacy": 86,
+      "longTerm": 66,
+    },
+    "doshaFlags": {
+      "aManglik": true,
+      "bManglik": true,
+      "hasManglikMismatch": false,
+    },
+    "method": "heuristic",
+    "recommendations": [
+      "Prioritize weekly check-ins to improve communication quality.",
+      "Align long-term goals before major commitments.",
+      "No critical dosha clash detected in current profile inputs.",
+    ],
+    "score": 72,
+    "summary": "Moderate compatibility with areas to strengthen.",
+  },
+  "message": "Matching completed",
+}
+`;

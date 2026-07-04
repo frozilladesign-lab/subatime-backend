@@ -142,7 +142,7 @@ export class FirebasePushService implements OnModuleInit {
     if (projectId && clientEmail && privateKey) {
       try {
         this.logger.log(`Firebase credential: using FIREBASE_PROJECT_ID=${projectId}`);
-        return admin.credential.cert({ projectId, clientEmail, privateKey } as ServiceAccount);
+        return admin.credential.cert({ projectId, clientEmail, privateKey });
       } catch (e) {
         this.logger.error(`Separate FIREBASE_ env vars credential failed: ${String(e)}`);
         return null;

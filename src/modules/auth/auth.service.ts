@@ -15,13 +15,12 @@ export class AuthService {
   ) {}
 
   async register(dto: RegisterDto) {
-    const prisma = this.prisma as any;
     const nameFromEmail = dto.email.split('@')[0]?.trim() || 'User';
     const displayName = dto.fullName?.trim() ? dto.fullName.trim() : nameFromEmail;
-    const existing = await prisma.user.findUnique({ where: { email: dto.email } });
+    const existing = await this.prisma.user.findUnique({ where: { email: dto.email } });
     if (existing) {
       if (!existing.passwordHash) {
-        const upgraded = await prisma.user.update({
+        const upgraded = await this.prisma.user.update({
           where: { id: existing.id },
           data: {
             name: displayName,
@@ -32,7 +31,7 @@ export class AuthService {
       }
       throw new BadRequestException('Email already registered. Please log in.');
     }
-    const user = await prisma.user.create({
+    const user = await this.prisma.user.create({
       data: {
         email: dto.email,
         name: displayName,
@@ -43,8 +42,7 @@ export class AuthService {
   }
 
   async login(dto: LoginDto) {
-    const prisma = this.prisma as any;
-    const user = await prisma.user.findUnique({ where: { email: dto.email } });
+    const user = await this.prisma.user.findUnique({ where: { email: dto.email } });
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
     }

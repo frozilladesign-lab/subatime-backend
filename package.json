@@ -5,10 +5,11 @@
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
-    "build": "prisma generate && nest build && node scripts/sync-public-for-vercel.cjs",
+    "build": "npm --prefix packages/jyotisha-engine run build && prisma generate && nest build && node scripts/sync-public-for-vercel.cjs",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "lint": "eslint \"src/**/*.ts\" --fix",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "jest",
     "prisma:generate": "prisma generate",
     "prisma:validate": "prisma validate",
@@ -18,6 +19,7 @@
     "prisma:seed": "prisma db seed"
   },
   "dependencies": {
+    "@subatime/jyotisha-engine": "file:packages/jyotisha-engine",
     "@nestjs/common": "^10.4.2",
     "@nestjs/config": "^3.2.3",
     "@nestjs/core": "^10.4.2",

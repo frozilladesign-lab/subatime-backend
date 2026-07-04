@@ -11,7 +11,6 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
 import { PredictionModule } from './modules/prediction/prediction.module';
 import { UserModule } from './modules/user/user.module';
 import { PrismaModule } from './database/prisma.module';
-import { DreamModule } from './modules/dream/dream.module';
 import { SubatimeModule } from './modules/subatime/subatime.module';
 import { CalendarModule } from './modules/calendar/calendar.module';
 import { HealthController } from './health.controller';
@@ -30,7 +29,6 @@ import { HealthController } from './health.controller';
     MatchingModule,
     NotificationsModule,
     PredictionModule,
-    DreamModule,
     SubatimeModule,
   ],
   controllers: [HealthController],

@@ -10,7 +10,7 @@ import { DateTime } from 'luxon';
 import { PrismaService } from '../../database/prisma.service';
 import { okResponse } from '../../common/utils/response.util';
 import { find as geoTzFind } from 'geo-tz';
-import { UpsertBirthProfileAuthDto, UpsertBirthProfileDto } from './dto/birth-profile.dto';
+import { UpsertBirthProfileAuthDto } from './dto/birth-profile.dto';
 import { PatchBirthProfileDto } from './dto/patch-birth-profile.dto';
 import { ChartService } from '../astrology/services/chart.service';
 
@@ -22,98 +22,6 @@ export class BirthProfileService {
     private readonly prisma: PrismaService,
     private readonly chartService: ChartService,
   ) {}
-
-  /** Legacy upsert by arbitrary user id (bootstrap tooling only). */
-  async upsert(dto: UpsertBirthProfileDto) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: dto.userId },
-      select: { id: true },
-    });
-    if (!user) {
-      await this.prisma.user.create({
-        data: {
-          id: dto.userId,
-          name: 'User',
-          email: `${dto.userId}@local.subatime`,
-        },
-      });
-    }
-
-    let lat = dto.latitude;
-    let lon = dto.longitude;
-    if ((!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) && dto.placeOfBirth.trim()) {
-      try {
-        const g = await this.geocode(dto.placeOfBirth.trim());
-        lat = g.lat;
-        lon = g.lon;
-      } catch (e) {
-        this.logger.warn(`Geocode failed for legacy upsert: ${String(e)}`);
-      }
-    }
-
-    const dateOfBirth = new Date(`${dto.dateOfBirth}T00:00:00.000Z`);
-    const tzResolved = this.resolveTimezone(lat, lon);
-    const tz =
-      tzResolved ??
-      (dto.timezone?.trim() ? dto.timezone.trim() : 'UTC');
-    const timezoneSource = tzResolved ? 'geo-tz' : dto.timezone?.trim() ? 'user-input' : 'legacy-unknown';
-    const localClock = this.normalizeClock(dto.timeOfBirth);
-    const timeOfBirth = this.composeBirthInstant(dto.dateOfBirth, localClock, tz);
-    const timezoneOffsetMinutes = this.resolveOffsetMinutes(
-      dto.dateOfBirth,
-      localClock,
-      tz,
-    );
-    const accuracy = this.normalizeBirthTimeAccuracy(dto.birthTimeAccuracy);
-
-    const profile = await this.prisma.birthProfile.upsert({
-      where: { userId: dto.userId },
-      update: {
-        birthLocalDate: dto.dateOfBirth,
-        birthLocalTime: localClock,
-        birthUtcTime: timeOfBirth,
-        dateOfBirth,
-        timeOfBirth,
-        placeOfBirth: dto.placeOfBirth,
-        latitude: lat,
-        longitude: lon,
-        onboardingIntent: dto.onboardingIntent ?? undefined,
-        birthTimeAccuracy: accuracy ?? undefined,
-        timezone: tz,
-        timezoneSource,
-        timezoneOffsetMinutes,
-        migrationSource: null,
-      },
-      create: {
-        userId: dto.userId,
-        birthLocalDate: dto.dateOfBirth,
-        birthLocalTime: localClock,
-        birthUtcTime: timeOfBirth,
-        dateOfBirth,
-        timeOfBirth,
-        placeOfBirth: dto.placeOfBirth,
-        latitude: lat,
-        longitude: lon,
-        onboardingIntent: dto.onboardingIntent ?? null,
-        birthTimeAccuracy: accuracy ?? null,
-        timezone: tz,
-        timezoneSource,
-        timezoneOffsetMinutes,
-        migrationSource: null,
-      },
-    });
-    await this.refreshChartSnapshot(dto.userId, profile.id, {
-      fullName: 'User',
-      birthDate: dto.dateOfBirth,
-      birthTime: localClock,
-      birthPlace: dto.placeOfBirth,
-      latitude: lat,
-      longitude: lon,
-      timezone: tz,
-    });
-
-    return okResponse(profile, 'Birth profile saved');
-  }
 
   async suggestPlaces(_userId: string, query: string) {
     const q = query.trim();
@@ -317,6 +225,14 @@ export class BirthProfileService {
     await this.mergeOnboardingMoods(userId, dto.onboardingMoods);
 
     let nextProfile = profile;
+    const intentNorm = this.normalizeIntent(dto.onboardingIntent);
+    if (intentNorm) {
+      nextProfile = await this.prisma.birthProfile.update({
+        where: { userId },
+        data: { onboardingIntent: intentNorm },
+      });
+    }
+
     const lagnaPatchProvided = dto.userKnownLagna !== undefined;
     if (lagnaPatchProvided) {
       const t = dto.userKnownLagna?.trim() ?? '';
@@ -399,7 +315,7 @@ export class BirthProfileService {
       ayanamsa: 'lahiri',
       lagnaUserOverride: profile.userKnownLagna ?? undefined,
     });
-    const chart = (generated.chartData ?? {}) as Record<string, unknown>;
+    const chart = generated.chartData ?? {};
     const planetMap = (generated.planetaryData ?? {}) as Record<string, unknown>;
 
     const offsetMinutes =
@@ -603,8 +519,8 @@ export class BirthProfileService {
         data: {
           birthProfileId,
           version,
-          chartData: generated.chartData as any,
-          planetaryData: generated.planetaryData as any,
+          chartData: generated.chartData as Prisma.InputJsonValue,
+          planetaryData: generated.planetaryData,
         },
       });
       await this.prisma.birthProfile.update({

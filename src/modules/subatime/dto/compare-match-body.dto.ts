@@ -10,18 +10,18 @@ import {
 
 export class CompareMatchBodyDto {
   @IsOptional()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @IsString()
   @MaxLength(200)
   fullName?: string;
 
   @IsOptional()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @IsString()
   zodiacSign?: string;
 
   @IsOptional()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @IsString()
   @Matches(/^\d{4}-\d{2}-\d{2}/, {
     message: 'dateOfBirth must start with YYYY-MM-DD',
@@ -29,15 +29,15 @@ export class CompareMatchBodyDto {
   dateOfBirth?: string;
 
   @IsOptional()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
   @IsString()
   @MinLength(2)
   birthLocation?: string;
 
   /** When provided, must be 24h `HH:mm` (same contract as compatibility profiles). */
   @IsOptional()
-  @Transform(({ value }) => {
-    if (value === undefined || value === null) return undefined;
+  @Transform(({ value }: { value: unknown }) => {
+    if (typeof value !== 'string' && typeof value !== 'number') return undefined;
     const s = String(value).trim();
     return s.length ? s : undefined;
   })

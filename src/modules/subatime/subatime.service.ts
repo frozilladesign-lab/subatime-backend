@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { JyotishaChartEngine } from '@subatime/jyotisha-engine';
 import { okResponse } from '../../common/utils/response.util';
 import { PrismaService } from '../../database/prisma.service';
 import { FirebasePushService } from '../push/firebase-push.service';
@@ -41,9 +42,20 @@ import { deriveDailyTransitsFromPool } from '../prediction/services/day-transits
 type SubatimeDayRating = 'great' | 'good' | 'mixed' | 'tense';
 type WindowLabel = 'morning' | 'afternoon' | 'evening' | 'night';
 
+/** Parsed shape of the JSON-stringified `actualOutcome` calibration payload feedback rows store. */
+type FeedbackCalibration = {
+  topWindowHit: boolean;
+  stressWindowHit: boolean;
+  calibrationScore: number;
+  bestEnergyWindow: string;
+};
+
 @Injectable()
 export class SubatimeService {
   private readonly logger = new Logger(SubatimeService.name);
+
+  /** Real Swiss-Ephemeris moon phase / illumination (Sun–Moon elongation). Reused per instance. */
+  private readonly moonEngine = new JyotishaChartEngine();
 
   constructor(
     private readonly dailyPredictionService: DailyPredictionService,
@@ -114,7 +126,7 @@ export class SubatimeService {
     if (!prediction) {
       return okResponse(null, 'Birth profile required to generate plan');
     }
-    const base = this.toDayPayload(prediction, user?.name);
+    const base = this.toDayPayload(prediction, user?.name, normalizedLang);
 
     // Re-derive transits with the request's lang so Sinhala users get Sinhala transit text.
     // Uses deriveDailyTransitsFromPool directly — no service injection needed.
@@ -499,6 +511,23 @@ export class SubatimeService {
     return out;
   }
 
+  /** Safely parses the JSON-stringified `actualOutcome` calibration payload feedback rows store. */
+  private parseFeedbackCalibration(raw: string | null): FeedbackCalibration | null {
+    try {
+      const payload = JSON.parse(raw ?? '{}') as Record<string, unknown>;
+      const cal = (payload.calibration ?? {}) as Record<string, unknown>;
+      return {
+        topWindowHit: cal.topWindowHit === true,
+        stressWindowHit: cal.stressWindowHit === true,
+        calibrationScore: typeof cal.calibrationScore === 'number' ? cal.calibrationScore : 0,
+        bestEnergyWindow:
+          typeof payload.bestEnergyWindow === 'string' ? payload.bestEnergyWindow.toLowerCase() : '',
+      };
+    } catch {
+      return null;
+    }
+  }
+
   private buildFeedDoLinesFromBlocks(
     blocks: Array<{ label: string; start: string; end: string }>,
   ): string[] {
@@ -666,7 +695,7 @@ export class SubatimeService {
       orderBy: { scheduledAt: 'desc' },
       take: safeLimit,
     });
-    const items = jobs.map((j, idx) => {
+    const items = jobs.map((j) => {
       const payload = (j.payload as Record<string, unknown>) ?? {};
       const title =
         typeof payload.title === 'string'
@@ -869,10 +898,10 @@ export class SubatimeService {
       }
       const extraction = analysis.extraction as Record<string, unknown> | undefined;
       const themes = Array.isArray(extraction?.themes)
-        ? extraction!.themes.map((t) => String(t).trim()).filter(Boolean)
+        ? extraction.themes.map((t) => String(t).trim()).filter(Boolean)
         : [];
       const symbols = Array.isArray(extraction?.symbols)
-        ? extraction!.symbols.map((s) => String(s).trim()).filter(Boolean)
+        ? extraction.symbols.map((s) => String(s).trim()).filter(Boolean)
         : [];
       for (const t of themes) {
         themeCounts.set(t, (themeCounts.get(t) ?? 0) + 1);
@@ -990,9 +1019,9 @@ export class SubatimeService {
   ) {
     const analysis = (d.analysis ?? null) as Record<string, unknown> | null;
     const ext = analysis?.extraction as Record<string, unknown> | undefined;
-    const themes = Array.isArray(ext?.themes) ? ext!.themes.map((t) => String(t)) : [];
+    const themes = Array.isArray(ext?.themes) ? ext.themes.map((t) => String(t)) : [];
     const symbols = Array.isArray(ext?.symbols)
-      ? ext!.symbols.map((s) => String(s)).filter(Boolean)
+      ? ext.symbols.map((s) => String(s)).filter(Boolean)
       : [];
     const insight =
       typeof ext?.summary_line === 'string' ? String(ext.summary_line).trim() : '';
@@ -1107,22 +1136,19 @@ export class SubatimeService {
   }
 
   async getMatchProfiles(userId: string) {
-    const items = await (this.prisma as any).compatibilityProfile.findMany({
+    const items = await this.prisma.compatibilityProfile.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
       take: 20,
     });
     return okResponse(
-      items.map((p: any) => ({
+      items.map((p) => ({
         id: p.id,
         name: p.fullName,
         sign: p.zodiacSign,
         overall: p.compatibilityScore ?? null,
         gender: p.gender,
-        dateOfBirth:
-          p.dateOfBirth instanceof Date
-            ? p.dateOfBirth.toISOString().slice(0, 10)
-            : String(p.dateOfBirth ?? '').slice(0, 10),
+        dateOfBirth: p.dateOfBirth.toISOString().slice(0, 10),
         birthLocation: p.birthLocation,
         timeOfBirth: p.timeOfBirth,
       })),
@@ -1154,8 +1180,10 @@ export class SubatimeService {
       orderBy: { version: 'desc' },
     });
     const cd = (chart?.chartData as Record<string, unknown>) ?? {};
-    const lagnaMe = String(me.lagna ?? cd?.lagna ?? '').trim();
-    const nakshatraMe = String(me.nakshatra ?? cd?.nakshatra ?? '').trim();
+    const cdLagna = typeof cd.lagna === 'string' ? cd.lagna : '';
+    const cdNakshatra = typeof cd.nakshatra === 'string' ? cd.nakshatra : '';
+    const lagnaMe = (me.lagna ?? cdLagna ?? '').trim();
+    const nakshatraMe = (me.nakshatra ?? cdNakshatra ?? '').trim();
     if (!lagnaMe || !nakshatraMe) {
       return okResponse(
         null,
@@ -1350,29 +1378,23 @@ export class SubatimeService {
     });
     const parsed = rows
       .map((r) => {
-        try {
-          return {
-            feedback: r.feedback,
-            payload: JSON.parse(r.actualOutcome ?? '{}') as Record<string, any>,
-          };
-        } catch {
-          return null;
-        }
+        const calibration = this.parseFeedbackCalibration(r.actualOutcome);
+        return calibration ? { feedback: r.feedback, calibration } : null;
       })
-      .filter((x): x is { feedback: 'good' | 'bad'; payload: Record<string, any> } => x != null);
+      .filter(
+        (x): x is { feedback: (typeof rows)[number]['feedback']; calibration: FeedbackCalibration } =>
+          x != null,
+      );
 
     const total = parsed.length;
     const good = parsed.filter((p) => p.feedback === 'good').length;
-    const topWindowHits = parsed.filter((p) => p.payload?.calibration?.topWindowHit === true).length;
-    const stressWindowHits = parsed.filter((p) => p.payload?.calibration?.stressWindowHit === true).length;
+    const topWindowHits = parsed.filter((p) => p.calibration.topWindowHit).length;
+    const stressWindowHits = parsed.filter((p) => p.calibration.stressWindowHit).length;
     const avgCalibration =
       total === 0
         ? 0
         : Number(
-            (
-              parsed.reduce((sum, p) => sum + Number(p.payload?.calibration?.calibrationScore ?? 0), 0) /
-              total
-            ).toFixed(4),
+            (parsed.reduce((sum, p) => sum + p.calibration.calibrationScore, 0) / total).toFixed(4),
           );
 
     return okResponse(
@@ -1445,15 +1467,11 @@ export class SubatimeService {
     let stressHits = 0;
     let eveningCalmSignals = 0;
     for (const row of nightlyWeek) {
-      try {
-        const payload = JSON.parse(row.actualOutcome ?? '{}') as Record<string, any>;
-        const cal = payload?.calibration ?? {};
-        if (cal.topWindowHit === true) topHits += 1;
-        if (cal.stressWindowHit === true) stressHits += 1;
-        const best = String(payload?.bestEnergyWindow ?? '').toLowerCase();
-        if (best === 'evening' && row.feedback === 'good') eveningCalmSignals += 1;
-      } catch {
-        /* ignore malformed payloads */
+      const cal = this.parseFeedbackCalibration(row.actualOutcome);
+      if (cal) {
+        if (cal.topWindowHit) topHits += 1;
+        if (cal.stressWindowHit) stressHits += 1;
+        if (cal.bestEnergyWindow === 'evening' && row.feedback === 'good') eveningCalmSignals += 1;
       }
     }
     const nightlyTotal = nightlyWeek.length;
@@ -1490,7 +1508,7 @@ export class SubatimeService {
     );
   }
 
-  private toDayPayload(prediction: DailyPredictionOutput, userName?: string) {
+  private toDayPayload(prediction: DailyPredictionOutput, userName?: string, lang = 'en') {
     const rating = this.deriveRating(
       prediction.confidenceScore,
       prediction.meta.scoreSpread,
@@ -1498,7 +1516,8 @@ export class SubatimeService {
     const bestWindow = prediction.goodTimes[0];
     const cautionWindow = prediction.badTimes[0];
     const dateObj = new Date(`${prediction.date}T00:00:00.000Z`);
-    const moonPhase = this.moonPhaseForDate(dateObj);
+    const moonStatus = this.moonStatusForDate(dateObj);
+    const moonPhase = moonStatus.phase;
     const phaseMeta = this.moonPhaseMeta(moonPhase);
     const contextWeight =
       prediction.personalization.contextWeights[
@@ -1516,11 +1535,7 @@ export class SubatimeService {
 
     const copyInput = {
       rating,
-      focus: prediction.personalization.mostRelevantContext as
-        | 'overall'
-        | 'career'
-        | 'love'
-        | 'health',
+      focus: prediction.personalization.mostRelevantContext,
       confidenceScore: prediction.confidenceScore,
       focusWeightPct: focusPct,
       bestWindow: bestWindow
@@ -1545,6 +1560,9 @@ export class SubatimeService {
       copy,
       predictionId: prediction.predictionId,
       date: prediction.date,
+      // Single source of notification wording (engine-built, bilingual). The Flutter local
+      // scheduler must schedule from this — it never composes notification copy itself.
+      notificationCandidates: prediction.notificationCandidates ?? null,
       // Sidereal ascendant (Lagna); anchor for whole-sign house scoring (not tropical Sun sign).
       userLagna: (prediction.meta.lagna ?? '').trim() || null,
       userName: userName ?? 'Friend',
@@ -1625,12 +1643,12 @@ export class SubatimeService {
       actions: {
         do: prediction.goodTimes.slice(0, 3).map((w, idx) => ({
           id: `do-${idx + 1}`,
-          text: `${w.label}: prioritize meaningful work between ${w.start} and ${w.end}.`,
+          text: this.buildDoText(w, idx, prediction.personalization.mostRelevantContext, lang),
           category: prediction.personalization.mostRelevantContext,
         })),
         avoid: prediction.badTimes.slice(0, 3).map((w, idx) => ({
           id: `avoid-${idx + 1}`,
-          text: `${w.label}: avoid emotionally loaded decisions between ${w.start} and ${w.end}.`,
+          text: this.buildAvoidText(w, idx, lang),
           category: 'stability',
         })),
       },
@@ -1638,8 +1656,8 @@ export class SubatimeService {
         phase: moonPhase,
         phaseLabel: phaseMeta.label,
         sign: prediction.meta.lagna,
-        illumination: phaseMeta.illumination,
-        energy: phaseMeta.energy,
+        illumination: moonStatus.illumination,
+        energy: lang === 'si' ? this.moonPhaseCopySi(moonPhase).energy : phaseMeta.energy,
       },
       transits: prediction.transits ?? [],
     };
@@ -1688,6 +1706,97 @@ export class SubatimeService {
           label: 'අඩු වන අරුණ සඳ',
           energy: 'නිවුණු සහ විමර්ශන කාලයක්—විවේකය සහ සැලැස්ම් කෙටියෙන්.',
         };
+    }
+  }
+
+  /** Focus-area noun for action copy (avoids one-size-fits-all "meaningful work"). */
+  private focusNoun(context: string, lang = 'en'): string {
+    const si = lang === 'si';
+    switch ((context ?? '').toLowerCase()) {
+      case 'career':
+        return si ? 'වැඩ' : 'work';
+      case 'love':
+        return si ? 'සබඳතා' : 'relationships';
+      case 'health':
+        return si ? 'සුවතාව' : 'wellbeing';
+      default:
+        return si ? 'ප්‍රමුඛතා' : 'priorities';
+    }
+  }
+
+  /** English window labels → Sinhala (keeps the daily read in one language). */
+  private localizedWindowLabel(label: string, lang: string): string {
+    if (lang !== 'si') return label.trim();
+    const map: Record<string, string> = {
+      'early morning': 'උදෑසන',
+      'morning focus': 'පෙරවරු අවධානය',
+      'late morning': 'දහවල් ආසන්නය',
+      'noon window': 'මධ්‍යාහ්නය',
+      'afternoon push': 'අපරභාග',
+      'evening start': 'සැන්දෑ ආරම්භය',
+      'evening prime': 'සැන්දෑ ප්‍රමුඛ',
+      'night calm': 'රාත්‍රී සන්සුන්',
+    };
+    return map[label.trim().toLowerCase()] ?? label.trim();
+  }
+
+  /** Distinct, rank-aware guidance for each favorable window (was a single repeated template). */
+  private buildDoText(
+    w: { label: string; start: string; end: string },
+    idx: number,
+    context: string,
+    lang = 'en',
+  ): string {
+    const window = `${w.start}–${w.end}`;
+    const labelText = this.localizedWindowLabel(w.label ?? '', lang);
+    const lead = labelText ? `${labelText} (${window})` : window;
+    const noun = this.focusNoun(context, lang);
+    if (lang === 'si') {
+      switch (idx) {
+        case 0:
+          return `${lead} ඔබේ ප්‍රබලම කාලයයි — වැදගත්ම ${noun} මුලින්ම කරගන්න.`;
+        case 1:
+          return `${lead} දිගටම කරගෙන යාමට සුදුසුයි — ${noun} කෙරෙහි ස්ථාවර වේගයක් තබාගන්න, අධික බරක් නොගන්න.`;
+        default:
+          return `${lead} සැහැල්ලු හිතකර කාලයකි — ඉක්මන් ජයග්‍රහණ, සැලසුම් හෝ විවේකයට යොදාගන්න.`;
+      }
+    }
+    switch (idx) {
+      case 0:
+        return `${lead} is your strongest window — front-load your most important ${noun} here.`;
+      case 1:
+        return `${lead} suits follow-through — keep steady momentum on ${noun} without overcommitting.`;
+      default:
+        return `${lead} is a lighter favorable slot — good for quick wins, planning, or a reset.`;
+    }
+  }
+
+  /** Distinct, rank-aware guidance for each low window. */
+  private buildAvoidText(
+    w: { label: string; start: string; end: string },
+    idx: number,
+    lang = 'en',
+  ): string {
+    const window = `${w.start}–${w.end}`;
+    const labelText = this.localizedWindowLabel(w.label ?? '', lang);
+    const lead = labelText ? `${labelText} (${window})` : window;
+    if (lang === 'si') {
+      switch (idx) {
+        case 0:
+          return `${lead} අඩු ශක්තියක් — විශාල තීරණ සහ අසීරු සංවාද කල් දමන්න.`;
+        case 1:
+          return `${lead} ආතතිය දැනිය හැක — කැපවීම් තහවුරු කිරීම හෝ ඝට්ටනවලට ප්‍රතිචාර දැක්වීම වළක්වන්න.`;
+        default:
+          return `${lead} — සැහැල්ලුවෙන් සිටින්න, අවධානය රැකගෙන ආතති සහගත කාර්යවලින් ඉවත් වන්න.`;
+      }
+    }
+    switch (idx) {
+      case 0:
+        return `${lead} runs low — postpone big decisions and difficult conversations.`;
+      case 1:
+        return `${lead} can feel tense — avoid locking in commitments or reacting to friction.`;
+      default:
+        return `${lead} — ease off, protect your focus, and step back from stressful tasks.`;
     }
   }
 
@@ -1782,7 +1891,46 @@ export class SubatimeService {
     return { year, monthIndex };
   }
 
+  /**
+   * Real moon status for a UTC instant: phase name + illuminated fraction (0–100),
+   * computed from the true Sun–Moon elongation via Swiss Ephemeris. Ayanamsa cancels
+   * out of the difference, so the sidereal longitudes are fine here. Falls back to the
+   * mean-synodic approximation if the ephemeris is unavailable.
+   */
+  private moonStatusForDate(date: Date): { phase: string; illumination: number } {
+    try {
+      const moonLon = this.moonEngine.moonSiderealLongitudeUtc(date);
+      const sunLon = this.moonEngine.sunSiderealLongitudeUtc(date);
+      const elongation = (((moonLon - sunLon) % 360) + 360) % 360;
+      const illumination = Math.round(((1 - Math.cos((elongation * Math.PI) / 180)) / 2) * 100);
+      return { phase: this.phaseFromElongation(elongation), illumination };
+    } catch (e) {
+      this.logger.warn(`Real moon computation failed; using synodic approximation: ${String(e)}`);
+      const phase = this.synodicPhaseForDate(date);
+      return { phase, illumination: this.moonPhaseMeta(phase).illumination };
+    }
+  }
+
+  /** 8-phase bucket from Sun–Moon elongation in degrees (0 = new, 180 = full). */
+  private phaseFromElongation(elongationDeg: number): string {
+    const e = ((elongationDeg % 360) + 360) % 360;
+    if (e < 22.5) return 'new-moon';
+    if (e < 67.5) return 'waxing-crescent';
+    if (e < 112.5) return 'first-quarter';
+    if (e < 157.5) return 'waxing-gibbous';
+    if (e < 202.5) return 'full';
+    if (e < 247.5) return 'waning-gibbous';
+    if (e < 292.5) return 'last-quarter';
+    if (e < 337.5) return 'waning-crescent';
+    return 'new-moon';
+  }
+
   private moonPhaseForDate(date: Date): string {
+    return this.moonStatusForDate(date).phase;
+  }
+
+  /** Mean-synodic fallback (used only when the ephemeris throws). */
+  private synodicPhaseForDate(date: Date): string {
     const baseNewMoon = Date.UTC(2000, 0, 6, 18, 14, 0);
     const synodicDays = 29.530588853;
     const dayMs = 86_400_000;
@@ -1934,7 +2082,8 @@ export class SubatimeService {
 
   getPublicSkyToday(lang?: string) {
     const date = this.normalizeDate(new Date());
-    const moonPhase = this.moonPhaseForDate(date);
+    const moonStatus = this.moonStatusForDate(date);
+    const moonPhase = moonStatus.phase;
     const meta = this.moonPhaseMeta(moonPhase);
     const normalizedLang = (lang ?? 'en').toLowerCase().trim();
     let phaseLabel = meta.label;
@@ -1950,7 +2099,7 @@ export class SubatimeService {
         dateUtc,
         moonPhase,
         phaseLabel,
-        illumination: meta.illumination,
+        illumination: moonStatus.illumination,
         energy,
       },
       'Public sky context',

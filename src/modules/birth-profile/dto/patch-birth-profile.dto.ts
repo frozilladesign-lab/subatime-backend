@@ -21,13 +21,18 @@ export class PatchBirthProfileDto {
   @IsOptional()
   @ValidateIf((_, v) => v != null && v !== '')
   @IsString()
-  @IsIn(LAGNA_SIGNS as unknown as string[])
+  @IsIn(LAGNA_SIGNS)
   userKnownLagna?: string | null;
 
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
   onboardingMoods?: string[];
+
+  /** Comma-separated focus ids (love/career/growth/dreams); unknown ids are dropped server-side. */
+  @IsOptional()
+  @IsString()
+  onboardingIntent?: string;
 
   @IsOptional()
   @IsString()

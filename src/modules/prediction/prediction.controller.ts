@@ -14,24 +14,6 @@ export class PredictionController {
     return this.dailyPredictionService.generateTodayManual();
   }
 
-  @Post(':id/explain')
-  explainPrediction(
-    @CurrentUserId() userId: string,
-    @Param('id') predictionId: string,
-  ) {
-    return this.dailyPredictionService.explainPrediction(userId, predictionId);
-  }
-
-  @Get('today')
-  getToday(@CurrentUserId() userId: string) {
-    return this.dailyPredictionService.getTodayForUser(userId);
-  }
-
-  @Get('feedback/stats')
-  getFeedbackStats(@CurrentUserId() userId: string) {
-    return this.dailyPredictionService.getFeedbackStats(userId);
-  }
-
   @Get(':id/feedback')
   getFeedback(
     @CurrentUserId() userId: string,

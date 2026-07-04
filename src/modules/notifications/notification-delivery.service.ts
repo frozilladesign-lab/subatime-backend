@@ -50,17 +50,27 @@ export class NotificationDeliveryService {
     }
 
     const payload = notification.payload as Record<string, unknown>;
-    const body = String(payload.body ?? payload.summary ?? 'Your daily guidance is ready.');
-    const title = String(payload.title ?? 'SubaTime');
+    const body =
+      typeof payload.body === 'string'
+        ? payload.body
+        : typeof payload.summary === 'string'
+          ? payload.summary
+          : 'Your daily guidance is ready.';
+    const title = typeof payload.title === 'string' ? payload.title : 'SubaTime';
     const data: Record<string, string> = {
       jobId,
-      type: String(notification.type),
+      type: notification.type,
     };
     const fcmExtra = payload.fcmData;
     if (fcmExtra != null && typeof fcmExtra === 'object' && !Array.isArray(fcmExtra)) {
       for (const [k, v] of Object.entries(fcmExtra as Record<string, unknown>)) {
         if (v === undefined || v === null) continue;
-        data[String(k)] = String(v);
+        data[k] =
+          typeof v === 'string'
+            ? v
+            : typeof v === 'number' || typeof v === 'boolean'
+              ? String(v)
+              : JSON.stringify(v);
       }
     }
 

@@ -3,6 +3,9 @@ import { CurrentUserId } from '../../common/decorators/current-user-id.decorator
 import { AuthGuard } from '../../common/guards/auth.guard';
 import { CompareMatchBodyDto } from './dto/compare-match-body.dto';
 import { DreamStressAnalyticsQueryDto } from './dto/dream-stress-analytics-query.dto';
+import { InterpretDreamDto } from './dto/interpret-dream.dto';
+import { NightlyCheckinDto } from './dto/nightly-checkin.dto';
+import { PersonalizePlanDayDto } from './dto/personalize-plan-day.dto';
 import { SubatimeService } from './subatime.service';
 
 @Controller('subatime')
@@ -22,14 +25,7 @@ export class SubatimeController {
   @Post('plan/day/personalize')
   personalizePlanDay(
     @CurrentUserId() userId: string,
-    @Body()
-    body: {
-      date?: string;
-      sleepQuality?: number;
-      stressLevel?: number;
-      fatigueLevel?: number;
-      focusArea?: 'overall' | 'career' | 'love' | 'health';
-    },
+    @Body() body: PersonalizePlanDayDto,
   ) {
     return this.subatimeService.getPersonalizedPlanDay(userId, body);
   }
@@ -61,9 +57,9 @@ export class SubatimeController {
   @Post('dream/interpret')
   interpretDream(
     @CurrentUserId() userId: string,
-    @Body() body: { text?: string; mood?: string; lang?: string },
+    @Body() body: InterpretDreamDto,
   ) {
-    return this.subatimeService.interpretDream(userId, body.text ?? '', body.mood, body.lang);
+    return this.subatimeService.interpretDream(userId, body.text, body.mood, body.lang);
   }
 
   @Get('dream/memory')
@@ -92,19 +88,7 @@ export class SubatimeController {
   @Post('feedback/nightly-checkin')
   submitNightlyCheckin(
     @CurrentUserId() userId: string,
-    @Body()
-    body: {
-      moodStability: number;
-      focusQuality: number;
-      socialEase: number;
-      stressIntensity: number;
-      bestEnergyWindow: 'morning' | 'afternoon' | 'evening' | 'night';
-      mostStressfulWindow: 'morning' | 'afternoon' | 'evening' | 'night';
-      sleepQuality?: number;
-      unusualStress?: number;
-      fatigueLevel?: number;
-      notes?: string;
-    },
+    @Body() body: NightlyCheckinDto,
   ) {
     return this.subatimeService.submitNightlyCheckin(userId, body);
   }

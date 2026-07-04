@@ -25,47 +25,6 @@ const LAGNA_SIGNS = [
   'Meena',
 ] as const;
 
-/** Legacy body shape — retained only for scripts/tests; prefer authenticated `/birth-profile`. */
-export class UpsertBirthProfileDto {
-  @IsString()
-  userId!: string;
-
-  @IsString()
-  dateOfBirth!: string;
-
-  @IsString()
-  timeOfBirth!: string;
-
-  @IsString()
-  placeOfBirth!: string;
-
-  @IsNumber()
-  latitude!: number;
-
-  @IsNumber()
-  longitude!: number;
-
-  @IsOptional()
-  @IsString()
-  @MaxLength(32)
-  onboardingIntent?: string;
-
-  @IsOptional()
-  @IsString()
-  @Matches(/^(exact|approx|approximate|unknown)$/)
-  birthTimeAccuracy?: string;
-
-  @IsOptional()
-  @IsString()
-  @MaxLength(64)
-  timezone?: string;
-
-  @IsOptional()
-  @IsString()
-  @Matches(/^(quick|accurate|veryAccurate)$/)
-  predictionTier?: string;
-}
-
 /** Signed-in upsert — coords optional & resolved via geocoder when missing. */
 export class UpsertBirthProfileAuthDto {
   @IsString()
@@ -131,6 +90,6 @@ export class UpsertBirthProfileAuthDto {
 
   @IsOptional()
   @IsString()
-  @IsIn(LAGNA_SIGNS as unknown as string[])
+  @IsIn(LAGNA_SIGNS)
   userKnownLagna?: string;
 }

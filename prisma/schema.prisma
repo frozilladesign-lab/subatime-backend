@@ -80,6 +80,7 @@ model User {
   predictionFeedback PredictionFeedback[]
   notificationJobs   NotificationJob[]
   deviceTokens       UserDeviceToken[]
+  localNotificationSchedules UserLocalNotificationSchedule[]
   sessions           UserSession[]
   matchResultsAsA    MatchResult[]        @relation("MatchUserA")
   matchResultsAsB    MatchResult[]        @relation("MatchUserB")
@@ -229,6 +230,15 @@ model DailyPrediction {
   scoreSpread     Float                @default(0.35)
   /// Same as personalization.mostRelevantContext at generation time (overall | career | love | health).
   dominantContext String               @default("overall")
+  /// Chart-input version used to generate this prediction (e.g. "local-birth-time-v2"). Null on
+  /// rows predating this marker — both null and any non-current value are treated as stale by
+  /// DailyPredictionService and trigger regeneration on next read. See buildChartInputFromBirthProfile().
+  chartInputVersion String?
+  /// Single source of notification wording (engine buildNotificationCandidates output):
+  /// block/best-window/power-hour candidates with en + si copy. Backend push services and
+  /// the Flutter local scheduler select from this; they never compose copy themselves.
+  /// Null on rows predating this field — treated as stale (regenerated on next read).
+  notificationCandidates Json?
   createdAt       DateTime             @default(now())
   updatedAt       DateTime             @updatedAt
   user            User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -327,6 +337,32 @@ model Report {
 
   @@index([userId, type, createdAt])
   @@map("reports")
+}
+
+/// Latest local-notification schedule state reported by the app, per user+device.
+/// The hourly FCM block push skips users whose local schedule is fresh (device already
+/// covers today's blocks locally) and only sends as a fallback when the schedule is
+/// stale, missing, or notification permission is not granted. See isLocalScheduleFresh().
+model UserLocalNotificationSchedule {
+  id                           String   @id @default(uuid()) @db.Uuid
+  userId                       String   @db.Uuid
+  /// Stable app-install identifier generated and persisted by the app.
+  deviceId                     String
+  /// When the app last successfully scheduled local block notifications.
+  lastLocalScheduleAt          DateTime
+  /// Last local calendar date (yyyy-MM-dd in deviceTimezone) covered by scheduled notifications.
+  localScheduleThroughDate     String?
+  deviceTimezone               String?
+  /// granted | denied | unknown
+  notificationPermissionStatus String?
+  scheduledCandidateIds        Json?
+  createdAt                    DateTime @default(now())
+  updatedAt                    DateTime @updatedAt
+  user                         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId])
+  @@index([userId])
+  @@map("user_local_notification_schedules")
 }
 
 model UserDeviceToken {

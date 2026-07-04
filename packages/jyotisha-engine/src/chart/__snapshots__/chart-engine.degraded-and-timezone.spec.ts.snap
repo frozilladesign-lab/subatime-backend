@@ -1,0 +1,17 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`JyotishaChartEngine timezone and coordinate validation converts local birth time to UTC correctly: Colombo (no DST, UTC+5:30): Colombo (no DST, UTC+5:30) calculationUtcDateTime 1`] = `"2024-01-15T01:00:00.000Z"`;
+
+exports[`JyotishaChartEngine timezone and coordinate validation converts local birth time to UTC correctly: Colombo (no DST, UTC+5:30): Colombo (no DST, UTC+5:30) inputLocalDateTime 1`] = `"2024-01-15T06:30:00.000+05:30"`;
+
+exports[`JyotishaChartEngine timezone and coordinate validation converts local birth time to UTC correctly: London during DST (BST, UTC+1): London during DST (BST, UTC+1) calculationUtcDateTime 1`] = `"2024-07-15T11:00:00.000Z"`;
+
+exports[`JyotishaChartEngine timezone and coordinate validation converts local birth time to UTC correctly: London during DST (BST, UTC+1): London during DST (BST, UTC+1) inputLocalDateTime 1`] = `"2024-07-15T12:00:00.000+01:00"`;
+
+exports[`JyotishaChartEngine timezone and coordinate validation converts local birth time to UTC correctly: New York during DST (EDT, UTC-4): New York during DST (EDT, UTC-4) calculationUtcDateTime 1`] = `"2024-07-15T16:00:00.000Z"`;
+
+exports[`JyotishaChartEngine timezone and coordinate validation converts local birth time to UTC correctly: New York during DST (EDT, UTC-4): New York during DST (EDT, UTC-4) inputLocalDateTime 1`] = `"2024-07-15T12:00:00.000-04:00"`;
+
+exports[`JyotishaChartEngine timezone and coordinate validation converts local birth time to UTC correctly: New York non-DST (EST, UTC-5): New York non-DST (EST, UTC-5) calculationUtcDateTime 1`] = `"2024-01-15T17:00:00.000Z"`;
+
+exports[`JyotishaChartEngine timezone and coordinate validation converts local birth time to UTC correctly: New York non-DST (EST, UTC-5): New York non-DST (EST, UTC-5) inputLocalDateTime 1`] = `"2024-01-15T12:00:00.000-05:00"`;

@@ -2,21 +2,26 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NotificationType, Prisma } from '@prisma/client';
 import { DateTime } from 'luxon';
+import type { NotificationCandidates, PowerHourNotificationCandidate } from '@subatime/jyotisha-engine';
 import { PrismaService } from '../../database/prisma.service';
 import { AlmanacService } from '../calendar/almanac.service';
 import { subhaDirectionOppositeMaru } from '../calendar/jyotisha-hora-lagna';
 import { buildSubhaTimePushData } from '../push/firebase-push.service';
 
-const LEAD_MS = 15 * 60 * 1000;
 /** Skip alerts that would fire in the immediate past or too soon to be useful. */
 const MIN_LEAD_AHEAD_MS = 90 * 1000;
 /** Do not schedule pushes more than this far ahead (hourly cron will re-run). */
 const MAX_SCHEDULE_HORIZON_MS = 36 * 60 * 60 * 1000;
 
 /**
- * Upserts `NotificationJob` rows for favorable horā windows (15 min before start),
- * using the same FCM progressive-disclosure payload as manual Subha pushes.
- * Delivery is handled by [NotificationPushDispatcherService] (and optional BullMQ worker).
+ * Upserts `NotificationJob` rows for favorable horā windows, using the same FCM
+ * progressive-disclosure payload as manual Subha pushes. Delivery is handled by
+ * [NotificationPushDispatcherService] (and optional BullMQ worker).
+ *
+ * Delivery-only: which horās are favorable, the send-at instant, and the title/body wording
+ * all come from the stored engine-built `DailyPrediction.notificationCandidates.powerHours`.
+ * The almanac is consulted only for the maru/subha direction fields of the existing FCM
+ * payload contract — never for wording.
  */
 @Injectable()
 export class ProactiveHoraPushSchedulerService {
@@ -37,6 +42,9 @@ export class ProactiveHoraPushSchedulerService {
     let jobsTouched = 0;
     let usersConsidered = 0;
 
+    const todayUtc = new Date();
+    todayUtc.setUTCHours(0, 0, 0, 0);
+
     const rows = await this.prisma.user.findMany({
       where: {
         deviceTokens: { some: {} },
@@ -51,11 +59,6 @@ export class ProactiveHoraPushSchedulerService {
             latitude: true,
             longitude: true,
             lagna: true,
-            charts: {
-              orderBy: { version: 'desc' },
-              take: 1,
-              select: { chartData: true },
-            },
           },
         },
       },
@@ -67,58 +70,33 @@ export class ProactiveHoraPushSchedulerService {
         const bp = u.birthProfile;
         if (!bp) continue;
 
-        const lagna = this.resolveLagna(bp);
-        if (!lagna) continue;
+        const pred = await this.prisma.dailyPrediction.findUnique({
+          where: { userId_date: { userId: u.id, date: todayUtc } },
+          select: { notificationCandidates: true },
+        });
+        const candidates = this.parseCandidates(pred?.notificationCandidates);
+        if (!candidates || candidates.powerHours.length === 0) continue;
 
-        const tz = (bp.timezone ?? '').trim() || 'Asia/Colombo';
-        const dateStr = DateTime.now().setZone(tz).toFormat('yyyy-MM-dd');
-
-        const envelope = this.almanac.computeDay({
-          date: dateStr,
-          timezone: tz,
-          latitude: bp.latitude,
-          longitude: bp.longitude,
-          lagna,
-        }) as { data?: Record<string, unknown> };
-        const data = envelope.data;
-        if (!data) continue;
-
-        const maru = String(data['maruDirection'] ?? '').trim();
-        const subha = (maru && subhaDirectionOppositeMaru(maru)) || 'South';
-
-        const dayHoras = (data['dayHoras'] as unknown[]) ?? [];
-        const nightHoras = (data['nightHoras'] as unknown[]) ?? [];
-        const horas = [...dayHoras, ...nightHoras];
+        const tz = (bp.timezone ?? '').trim() || candidates.timezone || 'Asia/Colombo';
+        const directions = this.dayDirections(candidates.date, tz, bp);
 
         let anyForUser = false;
-        for (const h of horas) {
-          if (!h || typeof h !== 'object') continue;
-          const m = h as Record<string, unknown>;
-          if (m['personalStatus'] !== 'favorable') continue;
+        for (const ph of candidates.powerHours) {
+          const alertMs = Date.parse(ph.sendAt);
+          if (!Number.isFinite(alertMs)) continue;
+          if (alertMs <= now + MIN_LEAD_AHEAD_MS) continue;
+          if (alertMs > now + MAX_SCHEDULE_HORIZON_MS) continue;
 
-          const lord = String(m['lord'] ?? '').trim();
-          const startIso = String(m['startUtc'] ?? '');
-          const endIso = String(m['endUtc'] ?? '');
-          if (!lord || !startIso || !endIso) continue;
-
-          const startMs = Date.parse(startIso);
-          if (!Number.isFinite(startMs)) continue;
-
-          const alertAt = new Date(startMs - LEAD_MS);
-          const tAlert = alertAt.getTime();
-          if (tAlert <= now + MIN_LEAD_AHEAD_MS) continue;
-          if (tAlert > now + MAX_SCHEDULE_HORIZON_MS) continue;
-
-          const timeBlock = `${this.formatHm(startIso, tz)}–${this.formatHm(endIso, tz)}`;
-          const title = '🌟 Your power hour soon';
-          const body = `A favorable ${lord} Horā for your ${lagna} chart starts in 15 minutes.`;
+          const alertAt = new Date(alertMs);
           const fcmData = buildSubhaTimePushData({
-            timeBlock,
+            timeBlock: this.formatWindow(ph, tz),
             reasonTitle: 'Personalized power hour',
-            reasonDetails: `This ${lord} Horā is favorable for your ${lagna} ascendant (whole-sign matrix). A strong window for priorities and clear decisions.`,
-            maruDirection: maru || 'North',
-            subhaDishawa: subha,
+            reasonDetails: ph.body,
+            maruDirection: directions.maru,
+            subhaDishawa: directions.subha,
           });
+          fcmData['deepLink'] = ph.deepLink;
+          fcmData['candidateId'] = ph.id;
 
           const whereUnique = {
             userId_type_scheduledAt: {
@@ -131,6 +109,7 @@ export class ProactiveHoraPushSchedulerService {
           const existing = await this.prisma.notificationJob.findUnique({ where: whereUnique });
           if (existing?.status === 'sent') continue;
 
+          const payload = { title: ph.title, body: ph.body, fcmData };
           if (existing == null) {
             await this.prisma.notificationJob.create({
               data: {
@@ -138,7 +117,7 @@ export class ProactiveHoraPushSchedulerService {
                 type: NotificationType.proactive_hora,
                 scheduledAt: alertAt,
                 status: 'pending',
-                payload: { title, body, fcmData } as Prisma.InputJsonValue,
+                payload,
               },
             });
           } else {
@@ -146,7 +125,7 @@ export class ProactiveHoraPushSchedulerService {
               where: whereUnique,
               data: {
                 status: 'pending',
-                payload: { title, body, fcmData } as Prisma.InputJsonValue,
+                payload,
               },
             });
           }
@@ -166,6 +145,51 @@ export class ProactiveHoraPushSchedulerService {
     }
   }
 
+  private parseCandidates(raw: Prisma.JsonValue | null | undefined): NotificationCandidates | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const o = raw as Record<string, unknown>;
+    if (!Array.isArray(o.powerHours)) return null;
+    return raw as unknown as NotificationCandidates;
+  }
+
+  /**
+   * Maru/subha directions for the existing FCM payload contract. Direction metadata only —
+   * wording lives in the candidate. Best-effort defaults when coordinates are missing.
+   */
+  private dayDirections(
+    dateStr: string,
+    tz: string,
+    bp: { latitude: number | null; longitude: number | null; lagna: string | null },
+  ): { maru: string; subha: string } {
+    try {
+      if (bp.latitude == null || bp.longitude == null) return { maru: 'North', subha: 'South' };
+      const envelope = this.almanac.computeDay({
+        date: dateStr,
+        timezone: tz,
+        latitude: bp.latitude,
+        longitude: bp.longitude,
+        lagna: (bp.lagna ?? '').trim() || undefined,
+      }) as { data?: Record<string, unknown> };
+      const maru = (typeof envelope.data?.['maruDirection'] === 'string'
+        ? envelope.data['maruDirection']
+        : '').trim();
+      const subha = (maru && subhaDirectionOppositeMaru(maru)) || 'South';
+      return { maru: maru || 'North', subha };
+    } catch {
+      return { maru: 'North', subha: 'South' };
+    }
+  }
+
+  private formatWindow(ph: PowerHourNotificationCandidate, tz: string): string {
+    return `${this.formatHm(ph.startTime, tz)}–${this.formatHm(ph.endTime, tz)}`;
+  }
+
+  private formatHm(isoUtc: string, tz: string): string {
+    const d = DateTime.fromISO(isoUtc, { zone: 'utc' }).setZone(tz);
+    if (!d.isValid) return isoUtc.slice(11, 16);
+    return d.toFormat('HH:mm');
+  }
+
   private userWantsProactiveHora(prefs: Prisma.JsonValue): boolean {
     if (prefs == null || typeof prefs !== 'object' || Array.isArray(prefs)) return true;
     const o = prefs as Record<string, unknown>;
@@ -176,26 +200,5 @@ export class ProactiveHoraPushSchedulerService {
       if (nr['proactiveHoraAlerts'] === false) return false;
     }
     return true;
-  }
-
-  private resolveLagna(bp: {
-    lagna: string | null;
-    charts: { chartData: Prisma.JsonValue }[];
-  }): string | undefined {
-    const chart0 = bp.charts[0];
-    let fromChart = '';
-    if (chart0?.chartData && typeof chart0.chartData === 'object' && !Array.isArray(chart0.chartData)) {
-      const cd = chart0.chartData as Record<string, unknown>;
-      fromChart = String(cd['lagna'] ?? '').trim();
-    }
-    const fromProfile = (bp.lagna ?? '').trim();
-    const s = fromChart || fromProfile;
-    return s.length ? s : undefined;
-  }
-
-  private formatHm(isoUtc: string, tz: string): string {
-    const d = DateTime.fromISO(isoUtc, { zone: 'utc' }).setZone(tz);
-    if (!d.isValid) return isoUtc.slice(11, 16);
-    return d.toFormat('HH:mm');
   }
 }

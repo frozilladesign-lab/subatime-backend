@@ -1,18 +1,23 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NotificationType, Prisma } from '@prisma/client';
+import { DateTime } from 'luxon';
+import type { NotificationCandidates } from '@subatime/jyotisha-engine';
 import { PrismaService } from '../../database/prisma.service';
 
-const LEAD_MS = 8 * 60 * 1000;
 const MIN_LEAD_AHEAD_MS = 90 * 1000;
 const MAX_SCHEDULE_HORIZON_MS = 36 * 60 * 60 * 1000;
 
 type DayRating = 'great' | 'good' | 'mixed' | 'tense';
 
 /**
- * Schedules one push per user per day: shortly before the first "good" prediction window
- * (from daily prediction JSON), when the day is rated strong enough. Uses `NotificationType.event`
- * and FCM `type: guide` so the client opens the Guide tab.
+ * Schedules one push per user per day shortly before the first "good" prediction window,
+ * when the day is rated strong enough. Uses `NotificationType.event` and FCM `type: guide`
+ * so the client opens the Guide tab.
+ *
+ * Delivery-only: whether/when to send is decided here (rating gate, lead time, horizon);
+ * the wording and send-at offset come from the stored engine-built
+ * `DailyPrediction.notificationCandidates.bestWindow` — never composed locally.
  */
 @Injectable()
 export class PredictionWindowPushSchedulerService {
@@ -52,9 +57,9 @@ export class PredictionWindowPushSchedulerService {
           where: { userId_date: { userId: u.id, date: todayUtc } },
           select: {
             id: true,
-            goodTimes: true,
             confidenceScore: true,
             scoreSpread: true,
+            notificationCandidates: true,
           },
         });
         if (!pred) continue;
@@ -64,28 +69,27 @@ export class PredictionWindowPushSchedulerService {
           rating === 'great' || (rating === 'good' && pred.confidenceScore >= 0.74);
         if (!strongEnough) continue;
 
-        const first = this.firstGoodTimeBlock(pred.goodTimes);
-        if (!first?.start) continue;
+        const candidates = this.parseCandidates(pred.notificationCandidates);
+        const bestWindow = candidates?.bestWindow;
+        if (!bestWindow) continue;
 
-        const dateIso = todayUtc.toISOString().slice(0, 10);
-        const startMs = this.utcHmOnDateMs(dateIso, first.start);
-        if (startMs == null) continue;
+        const block = candidates.blocks.find((b) => b.id === bestWindow.blockId);
+        const startMs = this.localHmToUtcMs(candidates.date, block?.startTime, candidates.timezone);
+        const alertMs = this.localHmToUtcMs(candidates.date, bestWindow.sendAt, candidates.timezone);
+        if (startMs == null || alertMs == null) continue;
 
-        const alertAt = new Date(startMs - LEAD_MS);
-        const tAlert = alertAt.getTime();
-        if (tAlert <= now + MIN_LEAD_AHEAD_MS) continue;
-        if (tAlert > now + MAX_SCHEDULE_HORIZON_MS) continue;
+        const alertAt = new Date(alertMs);
+        if (alertMs <= now + MIN_LEAD_AHEAD_MS) continue;
+        if (alertMs > now + MAX_SCHEDULE_HORIZON_MS) continue;
         if (startMs <= now) continue;
 
-        const label = (first.label ?? 'Strong window').trim() || 'Strong window';
-        const title = '✨ Your strongest window soon';
-        const body = `${label} opens soon — tap for today’s line and timing.`;
         const fcmData: Record<string, string> = {
           click_action: 'FLUTTER_NOTIFICATION_CLICK',
           type: 'guide',
           predictionId: pred.id,
-          planDate: dateIso,
+          planDate: candidates.date,
           slot: 'best_window',
+          deepLink: bestWindow.deepLink,
         };
 
         const whereUnique = {
@@ -99,6 +103,7 @@ export class PredictionWindowPushSchedulerService {
         const existing = await this.prisma.notificationJob.findUnique({ where: whereUnique });
         if (existing?.status === 'sent') continue;
 
+        const payload = { title: bestWindow.title, body: bestWindow.body, fcmData };
         if (existing == null) {
           await this.prisma.notificationJob.create({
             data: {
@@ -106,7 +111,7 @@ export class PredictionWindowPushSchedulerService {
               type: NotificationType.event,
               scheduledAt: alertAt,
               status: 'pending',
-              payload: { title, body, fcmData } as Prisma.InputJsonValue,
+              payload,
             },
           });
         } else {
@@ -114,7 +119,7 @@ export class PredictionWindowPushSchedulerService {
             where: whereUnique,
             data: {
               status: 'pending',
-              payload: { title, body, fcmData } as Prisma.InputJsonValue,
+              payload,
             },
           });
         }
@@ -130,6 +135,13 @@ export class PredictionWindowPushSchedulerService {
         `Prediction-window scheduler: touched ${jobsTouched} job(s) across ${usersConsidered} user(s).`,
       );
     }
+  }
+
+  private parseCandidates(raw: Prisma.JsonValue | null): NotificationCandidates | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const o = raw as Record<string, unknown>;
+    if (!Array.isArray(o.blocks)) return null;
+    return raw as unknown as NotificationCandidates;
   }
 
   private userWantsPredictionWindowAlerts(prefs: Prisma.JsonValue): boolean {
@@ -153,26 +165,20 @@ export class PredictionWindowPushSchedulerService {
     return 'tense';
   }
 
-  private firstGoodTimeBlock(raw: unknown): { label?: string; start?: string } | null {
-    if (!Array.isArray(raw) || raw.length === 0) return null;
-    const g = raw[0];
-    if (!g || typeof g !== 'object') return null;
-    const o = g as Record<string, unknown>;
-    const start = typeof o.start === 'string' ? o.start.trim() : '';
-    const label = typeof o.label === 'string' ? o.label.trim() : '';
-    if (!start) return null;
-    return { label: label || undefined, start };
-  }
-
-  private utcHmOnDateMs(dateIso: string, hm: string): number | null {
+  /**
+   * 'HH:mm' local wall-clock on `dateIso` in `timezone` → UTC epoch ms. Candidate times are
+   * local to the user's timezone (previously this scheduler treated them as UTC — pushes for
+   * non-UTC users fired hours off).
+   */
+  private localHmToUtcMs(dateIso: string, hm: string | undefined, timezone: string): number | null {
+    if (!hm) return null;
     const m = /^(\d{1,2}):(\d{2})$/.exec(hm.trim());
     if (!m) return null;
-    const hh = Math.min(23, Math.max(0, parseInt(m[1], 10)));
-    const mm = Math.min(59, Math.max(0, parseInt(m[2], 10)));
-    const d = new Date(
-      `${dateIso}T${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00.000Z`,
+    const dt = DateTime.fromISO(
+      `${dateIso}T${m[1].padStart(2, '0')}:${m[2]}:00`,
+      { zone: timezone || 'UTC' },
     );
-    const t = d.getTime();
-    return Number.isFinite(t) ? t : null;
+    if (!dt.isValid) return null;
+    return dt.toUTC().toMillis();
   }
 }

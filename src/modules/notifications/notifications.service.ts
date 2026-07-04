@@ -7,6 +7,7 @@ import {
   AdminSendNotificationDto,
   NotificationLogsQueryDto,
   RegisterDeviceDto,
+  ReportLocalScheduleDto,
   ScheduleNotificationDto,
 } from './dto/notifications.dto';
 
@@ -16,6 +17,50 @@ export class NotificationsService {
     private readonly prisma: PrismaService,
     private readonly queue: NotificationQueueService,
   ) {}
+
+  /**
+   * Store the app's local-notification schedule state (per user+device). The hourly FCM
+   * block push skips users whose local schedule is fresh — see isLocalScheduleFresh().
+   * Optional fields never overwrite previously reported values with null.
+   */
+  async reportLocalSchedule(userId: string, dto: ReportLocalScheduleDto) {
+    const lastLocalScheduleAt = new Date(dto.lastLocalScheduleAt);
+    const optional = {
+      ...(dto.localScheduleThroughDate !== undefined
+        ? { localScheduleThroughDate: dto.localScheduleThroughDate }
+        : {}),
+      ...(dto.deviceTimezone !== undefined ? { deviceTimezone: dto.deviceTimezone } : {}),
+      ...(dto.notificationPermissionStatus !== undefined
+        ? { notificationPermissionStatus: dto.notificationPermissionStatus }
+        : {}),
+      ...(dto.scheduledCandidateIds !== undefined
+        ? { scheduledCandidateIds: dto.scheduledCandidateIds }
+        : {}),
+    };
+
+    const row = await this.prisma.userLocalNotificationSchedule.upsert({
+      where: { userId_deviceId: { userId, deviceId: dto.deviceId } },
+      update: { lastLocalScheduleAt, ...optional },
+      create: {
+        userId,
+        deviceId: dto.deviceId,
+        lastLocalScheduleAt,
+        localScheduleThroughDate: dto.localScheduleThroughDate ?? null,
+        deviceTimezone: dto.deviceTimezone ?? null,
+        notificationPermissionStatus: dto.notificationPermissionStatus ?? null,
+        scheduledCandidateIds: dto.scheduledCandidateIds ?? [],
+      },
+    });
+
+    return okResponse(
+      {
+        deviceId: row.deviceId,
+        lastLocalScheduleAt: row.lastLocalScheduleAt.toISOString(),
+        localScheduleThroughDate: row.localScheduleThroughDate,
+      },
+      'Local notification schedule recorded',
+    );
+  }
 
   async schedule(dto: ScheduleNotificationDto) {
     const user = await this.prisma.user.findUnique({

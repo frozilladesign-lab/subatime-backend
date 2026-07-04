@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { CurrentUserId } from '../../common/decorators/current-user-id.decorator';
 import { AuthGuard } from '../../common/guards/auth.guard';
-import { UpsertBirthProfileAuthDto, UpsertBirthProfileDto } from './dto/birth-profile.dto';
+import { UpsertBirthProfileAuthDto } from './dto/birth-profile.dto';
 import { PatchBirthProfileDto } from './dto/patch-birth-profile.dto';
 import { BirthProfileService } from './birth-profile.service';
 
@@ -38,11 +38,5 @@ export class BirthProfileController {
   @UseGuards(AuthGuard)
   getAuditSnapshot(@CurrentUserId() userId: string) {
     return this.birthProfileService.getAuditSnapshot(userId);
-  }
-
-  /** Legacy create-with-userId — prefer authenticated `POST /birth-profile`. */
-  @Post('create')
-  create(@Body() dto: UpsertBirthProfileDto) {
-    return this.birthProfileService.upsert(dto);
   }
 }
