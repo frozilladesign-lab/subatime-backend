@@ -158,7 +158,17 @@ export class HourlyPredictionPushService {
     }
     if (!candidates) return null;
 
-    return candidates.blocks.find((b) => b.startTime === blockStart) ?? null;
+    const candidate = candidates.blocks.find((b) => b.startTime === blockStart) ?? null;
+    if (!candidate) return null;
+
+    // Phase B: honor the stored notification PLAN (frequency caps, category toggles,
+    // quiet hours, Rahu Kāla). Only planned candidates are delivered; legacy rows
+    // without a plan keep the pre-plan behavior.
+    const plan = (candidates as unknown as { plan?: { scheduled?: { candidateId?: string }[] } }).plan;
+    if (plan?.scheduled && !plan.scheduled.some((s) => s.candidateId === candidate.id)) {
+      return null;
+    }
+    return candidate;
   }
 
   private parseCandidates(raw: unknown): NotificationCandidates | null {

@@ -80,8 +80,18 @@ export class ProactiveHoraPushSchedulerService {
         const tz = (bp.timezone ?? '').trim() || candidates.timezone || 'Asia/Colombo';
         const directions = this.dayDirections(candidates.date, tz, bp);
 
+        // Phase B: when a plan exists, only its selected power hours go out
+        // (advanced-frequency users); legacy rows keep the pre-plan behavior.
+        const plan = (candidates as unknown as {
+          plan?: { scheduled?: { candidateId?: string }[] };
+        }).plan;
+        const plannedIds = plan?.scheduled
+          ? new Set(plan.scheduled.map((s) => s.candidateId))
+          : null;
+
         let anyForUser = false;
         for (const ph of candidates.powerHours) {
+          if (plannedIds && !plannedIds.has(ph.id)) continue;
           const alertMs = Date.parse(ph.sendAt);
           if (!Number.isFinite(alertMs)) continue;
           if (alertMs <= now + MIN_LEAD_AHEAD_MS) continue;

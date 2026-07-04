@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsBoolean, IsNumber, IsOptional, Max, Min, ValidateNested } from 'class-validator';
+import { IsBoolean, IsNumber, IsObject, IsOptional, Max, Min, ValidateNested } from 'class-validator';
 
 /** Slider values 0–100 for Profile → Adaptation sheet. */
 export class AdaptationPreferencesDto {
@@ -54,4 +54,12 @@ export class PatchUserPreferencesDto {
   @ValidateNested()
   @Type(() => NotificationsPreferencesDto)
   notifications?: NotificationsPreferencesDto;
+
+  /**
+   * Notifications & Guidance settings (full-object replace). Free-form here;
+   * `sanitizeNotificationSettings` is the authoritative validator server-side.
+   */
+  @IsOptional()
+  @IsObject()
+  notificationSettings?: Record<string, unknown>;
 }

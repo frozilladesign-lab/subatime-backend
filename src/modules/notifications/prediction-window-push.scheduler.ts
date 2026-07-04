@@ -73,9 +73,22 @@ export class PredictionWindowPushSchedulerService {
         const bestWindow = candidates?.bestWindow;
         if (!bestWindow) continue;
 
+        // Phase B: only schedule when the stored plan selected the best-window alert
+        // (frequency/category/quiet-hour/Rahu Kāla decisions live in the plan).
+        // Prefer the plan's (possibly quiet-shifted) send time.
+        const plan = (candidates as unknown as {
+          plan?: { scheduled?: { candidateId?: string; sendAt?: string }[] };
+        }).plan;
+        let sendAtHm = bestWindow.sendAt;
+        if (plan?.scheduled) {
+          const planned = plan.scheduled.find((s) => s.candidateId === 'best-window');
+          if (!planned) continue;
+          if (typeof planned.sendAt === 'string' && planned.sendAt) sendAtHm = planned.sendAt;
+        }
+
         const block = candidates.blocks.find((b) => b.id === bestWindow.blockId);
         const startMs = this.localHmToUtcMs(candidates.date, block?.startTime, candidates.timezone);
-        const alertMs = this.localHmToUtcMs(candidates.date, bestWindow.sendAt, candidates.timezone);
+        const alertMs = this.localHmToUtcMs(candidates.date, sendAtHm, candidates.timezone);
         if (startMs == null || alertMs == null) continue;
 
         const alertAt = new Date(alertMs);

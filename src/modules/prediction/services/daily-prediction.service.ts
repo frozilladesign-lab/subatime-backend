@@ -4,11 +4,17 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { DateTime } from 'luxon';
 import {
   buildNotificationCandidates,
+  buildNotificationPlan,
   type FavorableHoraInput,
   type NotificationCandidates,
+  type NotificationPlan,
 } from '@subatime/jyotisha-engine';
 import { PrismaService } from '../../../database/prisma.service';
 import { AlmanacService } from '../../calendar/almanac.service';
+import {
+  personalizationIntentFromFocusAreas,
+  resolveNotificationSettings,
+} from '../../user/notification-settings';
 import { taraIndex1to9, taraNameEn } from '../../astrology/jyotisha-tara';
 import { ChartService, NAKSHATRA_LIST } from '../../astrology/services/chart.service';
 import { NotificationQueueService } from '../../notifications/queue/notification.queue';
@@ -358,7 +364,7 @@ export class DailyPredictionService {
     ]);
     const personalization = this.buildPersonalization(
       contextWeights,
-      userRow?.birthProfile?.onboardingIntent,
+      this.personalizationIntentFor(userRow?.preferences, userRow?.birthProfile?.onboardingIntent),
       this.readOnboardingMoodsFromPreferences(userRow?.preferences),
     );
 
@@ -507,7 +513,7 @@ export class DailyPredictionService {
     ]);
     const personalization = this.buildPersonalization(
       contextWeights,
-      user.birthProfile?.onboardingIntent,
+      this.personalizationIntentFor(user.preferences, user.birthProfile?.onboardingIntent),
       this.readOnboardingMoodsFromPreferences(user.preferences),
     );
     const chartNeedsVerification = cd?.degraded === true;
@@ -580,9 +586,23 @@ export class DailyPredictionService {
 
     // Single source of notification wording — built by the engine from the exact same
     // scored blocks / transits persisted below, so Guide UI, FCM pushes, and local
-    // notifications can never diverge in copy.
+    // notifications can never diverge in copy. Phase B: copy is shaped by the user's
+    // Notifications & Guidance settings (tones, focus areas), and a delivery PLAN
+    // (frequency caps, category toggles, quiet hours, Rahu Kāla suppression) is
+    // computed and stored alongside so delivery layers send exactly what was planned.
     const candidatesDasha = cd?.dasha as Record<string, unknown> | undefined;
     const candidatesTz = (user.birthProfile.timezone ?? '').trim() || 'UTC';
+    const notifSettings = resolveNotificationSettings(
+      user.preferences,
+      user.birthProfile.onboardingIntent,
+    ).settings;
+    const almanacSignals = this.computeAlmanacSignals(
+      this.toDateString(predictionDay),
+      candidatesTz,
+      user.birthProfile.latitude,
+      user.birthProfile.longitude,
+      lagna,
+    );
     const notificationCandidates = buildNotificationCandidates({
       date: this.toDateString(predictionDay),
       timezone: candidatesTz,
@@ -596,14 +616,34 @@ export class DailyPredictionService {
       lagna,
       dashaLord:
         typeof candidatesDasha?.current === 'string' ? candidatesDasha.current : undefined,
-      favorableHoras: this.computeFavorableHoras(
-        this.toDateString(predictionDay),
-        candidatesTz,
-        user.birthProfile.latitude,
-        user.birthProfile.longitude,
-        lagna,
-      ),
+      favorableHoras: almanacSignals.favorableHoras,
+      summary,
+      tones: notifSettings.tones,
+      focusAreas: notifSettings.focusAreas,
+      rahuKalamLocal: almanacSignals.rahuKalamLocal,
     });
+    const notificationPlan = buildNotificationPlan({
+      candidates: notificationCandidates,
+      settings: {
+        categories: notifSettings.categories,
+        frequency: notifSettings.frequency,
+        preferredTimes: notifSettings.preferredTimes,
+        quietHours: notifSettings.quietHours,
+      },
+      powerHoursLocal:
+        notifSettings.frequency === 'advanced'
+          ? notificationCandidates.powerHours.map((ph) => ({
+              id: ph.id,
+              sendAt: DateTime.fromISO(ph.sendAt, { zone: 'utc' })
+                .setZone(candidatesTz)
+                .toFormat('HH:mm'),
+            }))
+          : undefined,
+    });
+    const candidatesWithPlan = {
+      ...notificationCandidates,
+      plan: notificationPlan,
+    } as NotificationCandidates & { plan: NotificationPlan };
 
     const dailyPrediction = await this.prisma.dailyPrediction.upsert({
       where: {
@@ -621,7 +661,7 @@ export class DailyPredictionService {
         scoreSpread,
         dominantContext: personalization.mostRelevantContext,
         chartInputVersion: CURRENT_CHART_INPUT_VERSION,
-        notificationCandidates: notificationCandidates as unknown as Prisma.InputJsonValue,
+        notificationCandidates: candidatesWithPlan as unknown as Prisma.InputJsonValue,
       },
       create: {
         userId,
@@ -634,7 +674,7 @@ export class DailyPredictionService {
         scoreSpread,
         dominantContext: personalization.mostRelevantContext,
         chartInputVersion: CURRENT_CHART_INPUT_VERSION,
-        notificationCandidates: notificationCandidates as unknown as Prisma.InputJsonValue,
+        notificationCandidates: candidatesWithPlan as unknown as Prisma.InputJsonValue,
       },
     });
 
@@ -731,7 +771,7 @@ export class DailyPredictionService {
       transits,
       confidenceScore,
       personalization,
-      notificationCandidates,
+      notificationCandidates: candidatesWithPlan,
       meta: {
         lagna,
         nakshatra,
@@ -752,18 +792,21 @@ export class DailyPredictionService {
 
 
   /**
-   * Favorable horā windows for the day (UTC instants), for power-hour candidates.
-   * Best-effort: returns [] on missing coordinates or almanac failure — power-hour
-   * pushes simply don't fire that day rather than blocking prediction generation.
+   * Almanac-derived signals for notification candidates: favorable horā windows
+   * (power-hour candidates) and the day's Rahu Kāla as local HH:mm (action-alert
+   * suppression in the notification plan). Best-effort: returns empty signals on
+   * missing coordinates or almanac failure rather than blocking generation.
    */
-  private computeFavorableHoras(
+  private computeAlmanacSignals(
     dateStr: string,
     timezone: string,
     latitude: number,
     longitude: number,
     lagna: string,
-  ): FavorableHoraInput[] {
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || !lagna.trim()) return [];
+  ): { favorableHoras: FavorableHoraInput[]; rahuKalamLocal?: { start: string; end: string } } {
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || !lagna.trim()) {
+      return { favorableHoras: [] };
+    }
     try {
       const envelope = this.almanac.computeDay({
         date: dateStr,
@@ -773,12 +816,12 @@ export class DailyPredictionService {
         lagna,
       }) as { data?: Record<string, unknown> };
       const data = envelope.data;
-      if (!data) return [];
+      if (!data) return { favorableHoras: [] };
       const horas = [
         ...((data['dayHoras'] as unknown[]) ?? []),
         ...((data['nightHoras'] as unknown[]) ?? []),
       ];
-      const out: FavorableHoraInput[] = [];
+      const favorableHoras: FavorableHoraInput[] = [];
       for (const h of horas) {
         if (!h || typeof h !== 'object') continue;
         const m = h as Record<string, unknown>;
@@ -787,12 +830,22 @@ export class DailyPredictionService {
         const startUtc = typeof m['startUtc'] === 'string' ? m['startUtc'] : '';
         const endUtc = typeof m['endUtc'] === 'string' ? m['endUtc'] : '';
         if (!lord || !startUtc || !endUtc) continue;
-        out.push({ lord, startUtc, endUtc });
+        favorableHoras.push({ lord, startUtc, endUtc });
       }
-      return out;
+
+      let rahuKalamLocal: { start: string; end: string } | undefined;
+      const rahu = data['rahuKala'] as Record<string, unknown> | undefined;
+      if (rahu && typeof rahu['startUtc'] === 'string' && typeof rahu['endUtc'] === 'string') {
+        const s = DateTime.fromISO(rahu['startUtc'], { zone: 'utc' }).setZone(timezone);
+        const e = DateTime.fromISO(rahu['endUtc'], { zone: 'utc' }).setZone(timezone);
+        if (s.isValid && e.isValid) {
+          rahuKalamLocal = { start: s.toFormat('HH:mm'), end: e.toFormat('HH:mm') };
+        }
+      }
+      return { favorableHoras, rahuKalamLocal };
     } catch (e) {
-      this.logger.warn(`Favorable horā computation failed for ${dateStr}: ${String(e)}`);
-      return [];
+      this.logger.warn(`Almanac signals failed for ${dateStr}: ${String(e)}`);
+      return { favorableHoras: [] };
     }
   }
 
@@ -904,6 +957,20 @@ export class DailyPredictionService {
     return m === true || m === 'true';
   }
 
+  /**
+   * Personalization intent derived from Notifications & Guidance settings (`focusAreas`
+   * is the single source of truth). Falls back to the legacy onboarding intent only for
+   * users whose settings haven't been migrated/stored yet.
+   */
+  private personalizationIntentFor(
+    preferences: unknown,
+    legacyOnboardingIntent?: string | null,
+  ): string | null {
+    const { settings } = resolveNotificationSettings(preferences, legacyOnboardingIntent);
+    const derived = personalizationIntentFromFocusAreas(settings.focusAreas);
+    return derived || legacyOnboardingIntent || null;
+  }
+
   private buildPersonalization(
     contextWeights: Record<string, number>,
     onboardingIntent?: string | null,
@@ -932,6 +999,13 @@ export class DailyPredictionService {
           bump('overall', 0.1);
           break;
         case 'dreams':
+          bump('overall', 0.18);
+          break;
+        // Tokens emitted by personalizationIntentFromFocusAreas (settings focusAreas).
+        case 'health':
+          bump('health', 0.22);
+          break;
+        case 'overall':
           bump('overall', 0.18);
           break;
         default:
@@ -1038,7 +1112,7 @@ export class DailyPredictionService {
     ]);
     const personalization = this.buildPersonalization(
       contextWeights,
-      profile?.onboardingIntent,
+      this.personalizationIntentFor(prefsRow?.preferences, profile?.onboardingIntent),
       this.readOnboardingMoodsFromPreferences(prefsRow?.preferences),
     );
 

@@ -3,6 +3,8 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { okResponse } from '../../common/utils/response.util';
 import { PatchUserPreferencesDto } from './dto/user-preferences.dto';
+import { invalidatePlanDayPayloadCache } from '../subatime/plan-day-payload.cache';
+import { resolveNotificationSettings, sanitizeNotificationSettings } from './notification-settings';
 import { RegisterDeviceTokenDto } from './dto/register-device-token.dto';
 
 @Injectable()
@@ -60,15 +62,35 @@ export class UserService {
   async getPreferences(userId: string) {
     const row = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { preferences: true },
+      select: { preferences: true, birthProfile: { select: { onboardingIntent: true } } },
     });
     const merged = this.normalizePreferencesJson(row?.preferences);
-    return okResponse(merged, 'User preferences fetched');
+
+    // Notifications & Guidance settings — single source of truth. First read for a user
+    // without stored settings migrates the legacy onboarding intent into focusAreas and
+    // persists the result so subsequent reads/edits work on stored state.
+    const { settings, migrated } = resolveNotificationSettings(
+      row?.preferences,
+      row?.birthProfile?.onboardingIntent,
+    );
+    if (migrated) {
+      const root = this.parseJsonObject(row?.preferences);
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          preferences: { ...root, notificationSettings: settings } as unknown as Prisma.InputJsonValue,
+        },
+      });
+    }
+
+    return okResponse({ ...merged, notificationSettings: settings }, 'User preferences fetched');
   }
 
   async patchPreferences(userId: string, dto: PatchUserPreferencesDto) {
-    if (dto.adaptation == null && dto.notifications == null) {
-      throw new BadRequestException('Provide at least one preferences key (e.g. adaptation or notifications).');
+    if (dto.adaptation == null && dto.notifications == null && dto.notificationSettings == null) {
+      throw new BadRequestException(
+        'Provide at least one preferences key (e.g. adaptation, notifications, or notificationSettings).',
+      );
     }
 
     const row = await this.prisma.user.findUnique({
@@ -103,13 +125,38 @@ export class UserService {
       next = { ...next, notifications: nextNotif };
     }
 
+    if (dto.notificationSettings != null) {
+      // Whole-object replace (the settings screen always saves the full shape);
+      // sanitize server-side so bad values can never persist.
+      next = {
+        ...next,
+        notificationSettings: sanitizeNotificationSettings(dto.notificationSettings),
+      };
+    }
+
     await this.prisma.user.update({
       where: { id: userId },
       data: { preferences: next as Prisma.InputJsonValue },
     });
 
+    if (dto.notificationSettings != null) {
+      // Settings shape copy/plan generation. Mark today's + tomorrow's predictions
+      // stale (null candidates → regenerated with the new settings on next read) and
+      // drop cached plan-day payloads so the change is visible immediately.
+      const today = new Date();
+      today.setUTCHours(0, 0, 0, 0);
+      const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+      await this.prisma.dailyPrediction.updateMany({
+        where: { userId, date: { in: [today, tomorrow] } },
+        data: { notificationCandidates: Prisma.DbNull },
+      });
+      invalidatePlanDayPayloadCache(userId, today.toISOString().slice(0, 10));
+      invalidatePlanDayPayloadCache(userId, tomorrow.toISOString().slice(0, 10));
+    }
+
     const normalized = this.normalizePreferencesJson(next);
-    return okResponse(normalized, 'User preferences updated');
+    const { settings } = resolveNotificationSettings(next, null);
+    return okResponse({ ...normalized, notificationSettings: settings }, 'User preferences updated');
   }
 
   private parseJsonObject(raw: unknown): Record<string, unknown> {

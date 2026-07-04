@@ -94,11 +94,11 @@ describe('buildNotificationCandidates', () => {
     expect(caution.body.startsWith('Runs heavier')).toBe(true);
   });
 
-  it('falls back to context copy when no transit of the needed type exists', () => {
+  it('falls back to topic copy when no transit of the needed type exists', () => {
     const input = { ...baseInput(), transits: [] as DayTransitDto[] };
     const out = buildNotificationCandidates(input);
     const peak = out.blocks.find((b) => b.type === 'peak')!;
-    expect(peak.reasonCode).toBe('context:career');
+    expect(peak.reasonCode).toBe('topic:career');
     expect(peak.body).toContain('decisive work');
     expect(peak.bodySi.length).toBeGreaterThan(0);
   });

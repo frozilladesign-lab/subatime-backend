@@ -92,4 +92,21 @@ export type {
   NotificationContext,
   PowerHourNotificationCandidate,
 } from './prediction/notification-candidates';
+export type {
+  GuidanceNotificationCandidate,
+  NotificationCandidateCategory,
+  NotificationFocusArea,
+  NotificationImportance,
+  NotificationTone,
+} from './prediction/notification-candidates';
 export { buildNotificationCandidates } from './prediction/notification-candidates';
+
+export type {
+  BuildNotificationPlanInput,
+  DroppedNotification,
+  NotificationFrequency,
+  NotificationPlan,
+  NotificationPlanSettings,
+  PlannedNotification,
+} from './prediction/notification-plan';
+export { buildNotificationPlan } from './prediction/notification-plan';
