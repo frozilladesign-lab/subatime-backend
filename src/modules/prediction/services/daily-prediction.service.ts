@@ -719,6 +719,7 @@ export class DailyPredictionService {
         dominantContext: personalization.mostRelevantContext,
         chartInputVersion: CURRENT_CHART_INPUT_VERSION,
         notificationCandidates: candidatesWithPlan as unknown as Prisma.InputJsonValue,
+        chartContext: (chartContext ?? Prisma.DbNull) as unknown as Prisma.InputJsonValue,
       },
       create: {
         userId,
@@ -732,6 +733,7 @@ export class DailyPredictionService {
         dominantContext: personalization.mostRelevantContext,
         chartInputVersion: CURRENT_CHART_INPUT_VERSION,
         notificationCandidates: candidatesWithPlan as unknown as Prisma.InputJsonValue,
+        chartContext: (chartContext ?? Prisma.DbNull) as unknown as Prisma.InputJsonValue,
       },
     });
 
@@ -901,6 +903,14 @@ export class DailyPredictionService {
       transits,
       focusAreas,
     });
+  }
+
+  /** Parse a stored chartContext JSON back into a ChartContextResult (perf: avoids recompute). */
+  private parseStoredChartContext(raw: unknown): ChartContextResult | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const o = raw as Record<string, unknown>;
+    if (typeof o.dominantTheme !== 'string' || typeof o.dominantContext !== 'string') return null;
+    return o as unknown as ChartContextResult;
   }
 
   private readNatalPlanetLongitudes(cd: Record<string, unknown> | undefined): Record<string, number> {
@@ -1288,6 +1298,7 @@ export class DailyPredictionService {
       confidenceScore: number;
       scoreSpread: number;
       notificationCandidates?: unknown;
+      chartContext?: unknown;
       createdAt: Date;
       updatedAt: Date;
       id: string;
@@ -1370,12 +1381,19 @@ export class DailyPredictionService {
       if (nakshatra.trim().length > 0) {
         taraNoon = this.computeTaraAtLocalNoon(nakshatra, dateStr, tz, ay);
       }
-      // P0: chart-derived theme, recomputed on read so cache hits stay chart-personalized.
-      const focusAreas = resolveNotificationSettings(
-        prefsRow?.preferences,
-        profile.onboardingIntent,
-      ).settings.focusAreas;
-      chartContext = this.computeChartContextFor(cd, prediction.date, focusAreas);
+      // P0 + perf: reuse the chart-derived context stored at generation time so cache
+      // reads don't re-run Swiss-Ephemeris transit math. Only recompute for legacy rows
+      // that predate the stored column (chartContext == null).
+      const storedCtx = this.parseStoredChartContext(prediction.chartContext);
+      if (storedCtx) {
+        chartContext = storedCtx;
+      } else {
+        const focusAreas = resolveNotificationSettings(
+          prefsRow?.preferences,
+          profile.onboardingIntent,
+        ).settings.focusAreas;
+        chartContext = this.computeChartContextFor(cd, prediction.date, focusAreas);
+      }
     }
 
     const personalization = this.buildPersonalization(

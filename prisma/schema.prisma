@@ -241,13 +241,19 @@ model DailyPrediction {
   /// the Flutter local scheduler select from this; they never compose copy themselves.
   /// Null on rows predating this field — treated as stale (regenerated on next read).
   notificationCandidates Json?
+  /// Cached chart-derived context (engine computeChartContext output: dominant theme,
+  /// active Lagna/Moon houses, dasha house, reasons, theme scores). Persisted so the
+  /// cache-read path (enrichPrediction) reuses it instead of re-running Swiss Ephemeris
+  /// transit calculations on every /plan/day read. Null on legacy rows → recomputed once.
+  chartContext    Json?
   createdAt       DateTime             @default(now())
   updatedAt       DateTime             @updatedAt
   user            User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
   feedback        PredictionFeedback[]
 
+  // @@unique([userId, date]) already provides the btree used for both point lookups and
+  // date-range scans; a separate @@index([userId, date]) would be a redundant duplicate.
   @@unique([userId, date])
-  @@index([userId, date])
   @@map("daily_predictions")
 }
 
@@ -369,8 +375,9 @@ model UserLocalNotificationSchedule {
   updatedAt                    DateTime @updatedAt
   user                         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // @@unique([userId, deviceId]) covers userId-only lookups via its leftmost prefix, so a
+  // separate @@index([userId]) would be a redundant duplicate.
   @@unique([userId, deviceId])
-  @@index([userId])
   @@map("user_local_notification_schedules")
 }
 
