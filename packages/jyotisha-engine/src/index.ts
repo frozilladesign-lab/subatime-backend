@@ -120,3 +120,13 @@ export type {
   TransitLongitude,
 } from './prediction/chart-context';
 export { computeChartContext, coreContextOf, wholeSignHouse as wholeSignHouseFromRef } from './prediction/chart-context';
+
+export type {
+  DigestDayInput,
+  DigestDayRef,
+  MonthlyDigest,
+  MonthlyDigestInput,
+  WeeklyDigest,
+  WeeklyDigestInput,
+} from './prediction/digest';
+export { buildMonthlyDigest, buildWeeklyDigest } from './prediction/digest';
