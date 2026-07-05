@@ -35,6 +35,12 @@ export class SubatimeController {
     return this.subatimeService.getPlanMonth(userId, month);
   }
 
+  /** Weekly + monthly digests (generated once per period, reused after). App schedules from these. */
+  @Get('digests')
+  getDigests(@CurrentUserId() userId: string) {
+    return this.subatimeService.getDigests(userId);
+  }
+
   @Get('feed')
   getFeed(
     @CurrentUserId() userId: string,

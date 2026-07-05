@@ -6,6 +6,7 @@ import { FirebasePushService } from '../push/firebase-push.service';
 import { DreamExtractionService } from '../ai/services/dream-extraction.service';
 import { MatchingService } from '../matching/matching.service';
 import { FeedbackLearningService } from '../prediction/services/feedback-learning.service';
+import { DigestService } from '../prediction/services/digest.service';
 import {
   DailyPredictionOutput,
   DailyPredictionService,
@@ -65,7 +66,33 @@ export class SubatimeService {
     private readonly dreamExtraction: DreamExtractionService,
     private readonly wellnessSnapshots: WellnessSnapshotService,
     private readonly firebasePush: FirebasePushService,
+    private readonly digestService: DigestService,
   ) {}
+
+  /**
+   * Weekly + monthly digests for the signed-in user. Generated once per ISO week / calendar
+   * month and reused after (unique userId+kind+periodKey → no duplicates). The full audit is
+   * included only when personalization-audit exposure is on (dev / EXPOSE flag).
+   */
+  async getDigests(userId: string) {
+    const digests = await this.digestService.getUserDigests(userId);
+    const strip = (d: (typeof digests)['weekly']) => {
+      if (!d) return null;
+      if (this.exposePersonalizationAudit()) return d;
+      // Production: drop the engine audit block, keep the deliverable digest + timing.
+      const { digest, ...rest } = d;
+      const { audit: _audit, ...digestNoAudit } = digest as typeof digest & { audit?: unknown };
+      return { ...rest, digest: digestNoAudit };
+    };
+    return okResponse(
+      {
+        weekly: strip(digests.weekly),
+        monthly: strip(digests.monthly),
+        ...(this.exposePersonalizationAudit() ? { dropped: digests.dropped } : {}),
+      },
+      'Digests fetched',
+    );
+  }
 
   /** Sends a test push to all device tokens for this user. Used to verify FCM pipeline. */
   async sendTestPush(userId: string) {

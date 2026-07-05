@@ -49,6 +49,7 @@ describe('GET /api/subatime/public/preview/day (guest preview)', () => {
       unusedDreamExtraction,
       unusedWellnessSnapshots,
       unusedFirebasePush,
+      {} as never,
     );
   };
 
@@ -92,6 +93,7 @@ describe('GET /api/subatime/public/preview/day (guest preview)', () => {
       unusedDreamExtraction,
       unusedWellnessSnapshots,
       unusedFirebasePush,
+      {} as never,
     );
 
     service.getGuestPreviewDay('2000-01-01', 'Alex');

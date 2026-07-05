@@ -83,6 +83,7 @@ model User {
   notificationJobs   NotificationJob[]
   deviceTokens       UserDeviceToken[]
   localNotificationSchedules UserLocalNotificationSchedule[]
+  digests            UserDigest[]
   sessions           UserSession[]
   matchResultsAsA    MatchResult[]        @relation("MatchUserA")
   matchResultsAsB    MatchResult[]        @relation("MatchUserB")
@@ -379,6 +380,34 @@ model UserLocalNotificationSchedule {
   // separate @@index([userId]) would be a redundant duplicate.
   @@unique([userId, deviceId])
   @@map("user_local_notification_schedules")
+}
+
+/// Generated weekly/monthly digest per user + period (Phase C). One row per ISO week /
+/// calendar month enforces "max 1 weekly per week, max 1 monthly per month" — the unique
+/// (userId, kind, periodKey) makes duplicate digests impossible. The engine-built digest
+/// (title/body/audit + chosen send time) lives in `payload`; the app schedules from it and
+/// the FCM fallback delivers it, exactly like the daily path.
+model UserDigest {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @db.Uuid
+  /// weekly | monthly
+  kind       String
+  /// ISO week ("2026-W28") or month ("2026-08").
+  periodKey  String
+  /// UTC instant of the chosen local send time (Sunday 19:00 / 1st 07:30, quiet-adjusted).
+  sendAt     DateTime
+  timezone   String
+  /// Engine digest + scheduling metadata (localized copy, audit, sendAt local, reason).
+  payload    Json
+  /// scheduled | sent
+  status     String   @default("scheduled")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, kind, periodKey])
+  @@index([userId, kind])
+  @@map("user_digests")
 }
 
 model UserDeviceToken {

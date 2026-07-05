@@ -913,6 +913,60 @@ export class DailyPredictionService {
     return o as unknown as ChartContextResult;
   }
 
+  /**
+   * Per-day chart signals for weekly/monthly digest rollups. Reuses stored `chartContext`
+   * from daily_predictions where present (no recompute); computes missing days once from
+   * the user's chart (Swiss Ephemeris transit positions). Loads the chart a single time.
+   */
+  async getDigestDaySignals(
+    userId: string,
+    dates: string[],
+  ): Promise<{ date: string; dominantTheme: string; themeScores: Record<string, number>; confidenceScore: number }[]> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      include: { birthProfile: true },
+    });
+    if (!user?.birthProfile) return [];
+
+    let cd: Record<string, unknown> | undefined;
+    const chart = await this.prisma.astrologyChart.findFirst({
+      where: { birthProfileId: user.birthProfile.id },
+      orderBy: { version: 'desc' },
+    });
+    cd = chart?.chartData as Record<string, unknown> | undefined;
+    if (!cd) {
+      cd = this.chartService.generate(
+        buildChartInputFromBirthProfile(user.name, user.birthProfile),
+      ).chartData;
+    }
+    const focusAreas = resolveNotificationSettings(
+      user.preferences,
+      user.birthProfile.onboardingIntent,
+    ).settings.focusAreas;
+
+    const dateObjs = dates.map((d) => new Date(`${d}T00:00:00.000Z`));
+    const existing = await this.prisma.dailyPrediction.findMany({
+      where: { userId, date: { in: dateObjs } },
+      select: { date: true, chartContext: true, confidenceScore: true },
+    });
+    const byDate = new Map(existing.map((e) => [this.toDateString(e.date), e]));
+
+    const out: { date: string; dominantTheme: string; themeScores: Record<string, number>; confidenceScore: number }[] = [];
+    for (const d of dates) {
+      const ex = byDate.get(d);
+      const stored = ex ? this.parseStoredChartContext(ex.chartContext) : null;
+      const ctx = stored ?? this.computeChartContextFor(cd, new Date(`${d}T00:00:00.000Z`), focusAreas);
+      if (!ctx) continue;
+      out.push({
+        date: d,
+        dominantTheme: ctx.dominantTheme,
+        themeScores: ctx.themeScores,
+        confidenceScore: typeof ex?.confidenceScore === 'number' ? ex.confidenceScore : 0.6,
+      });
+    }
+    return out;
+  }
+
   private readNatalPlanetLongitudes(cd: Record<string, unknown> | undefined): Record<string, number> {
     const raw = cd?.planetLongitudes;
     const out: Record<string, number> = {};
