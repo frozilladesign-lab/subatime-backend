@@ -1508,6 +1508,17 @@ export class SubatimeService {
     );
   }
 
+  /**
+   * Whether to include the full `personalizationAudit` in the plan-day payload. On by default
+   * outside production; set `EXPOSE_PERSONALIZATION_AUDIT=true` to opt in on the deployed
+   * backend for QA (comparing simulator vs iPhone across profiles).
+   */
+  private exposePersonalizationAudit(): boolean {
+    if (process.env.EXPOSE_PERSONALIZATION_AUDIT === 'true') return true;
+    if (process.env.EXPOSE_PERSONALIZATION_AUDIT === 'false') return false;
+    return process.env.NODE_ENV !== 'production';
+  }
+
   private toDayPayload(prediction: DailyPredictionOutput, userName?: string, lang = 'en') {
     const rating = this.deriveRating(
       prediction.confidenceScore,
@@ -1538,6 +1549,7 @@ export class SubatimeService {
       focus: prediction.personalization.mostRelevantContext,
       confidenceScore: prediction.confidenceScore,
       focusWeightPct: focusPct,
+      dominantTheme: prediction.personalizationAudit?.finalDominantTheme ?? undefined,
       bestWindow: bestWindow
         ? { start: bestWindow.start, end: bestWindow.end, label: bestWindow.label }
         : undefined,
@@ -1563,6 +1575,16 @@ export class SubatimeService {
       // Single source of notification wording (engine-built, bilingual). The Flutter local
       // scheduler must schedule from this — it never composes notification copy itself.
       notificationCandidates: prediction.notificationCandidates ?? null,
+      // P0: chart identity + dominant theme so the client can (a) invalidate a cached plan
+      // whose chart differs from the current profile, and (b) show the chart-derived theme.
+      birthProfileHash: prediction.personalizationAudit?.birthProfileHash ?? null,
+      chartHash: prediction.personalizationAudit?.chartHash ?? null,
+      dominantTheme: prediction.personalizationAudit?.finalDominantTheme ?? null,
+      // Dev-mode transparency: proves the prediction is chart-driven (same day, different chart
+      // ⇒ different theme/houses/reasons). Gated so it never ships to production clients.
+      ...(this.exposePersonalizationAudit()
+        ? { personalizationAudit: prediction.personalizationAudit ?? null }
+        : {}),
       // Sidereal ascendant (Lagna); anchor for whole-sign house scoring (not tropical Sun sign).
       userLagna: (prediction.meta.lagna ?? '').trim() || null,
       userName: userName ?? 'Friend',

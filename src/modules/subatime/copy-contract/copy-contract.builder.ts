@@ -56,8 +56,15 @@ export function buildPlanDayCopy(input: PlanDayCopyBuildInput): PlanDayCopyContr
     });
   }
 
+  // P0: theme-forward headline so different charts read differently on the same day.
+  // A concrete chart theme wins; `overall`/unset falls back to the rating-tone headline.
+  const theme = input.dominantTheme;
+  const themedHeadline = theme && theme !== 'overall';
+
   return {
-    headline: { key: `guidance.headline.${rating}`, vars: {} },
+    headline: themedHeadline
+      ? { key: `guidance.headline.theme.${theme}`, vars: {} }
+      : { key: `guidance.headline.${rating}`, vars: {} },
     summary: {
       key: `guidance.summary.${rating}`,
       vars: {

@@ -110,3 +110,13 @@ export type {
   PlannedNotification,
 } from './prediction/notification-plan';
 export { buildNotificationPlan } from './prediction/notification-plan';
+
+export type {
+  ActiveHouse,
+  ChartContextInput,
+  ChartContextResult,
+  CoreContext,
+  LifeTheme,
+  TransitLongitude,
+} from './prediction/chart-context';
+export { computeChartContext, coreContextOf, wholeSignHouse as wholeSignHouseFromRef } from './prediction/chart-context';

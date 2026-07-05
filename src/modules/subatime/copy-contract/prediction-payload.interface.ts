@@ -34,4 +34,10 @@ export interface PlanDayCopyBuildInput {
   focusWeightPct: number;
   bestWindow?: { start: string; end: string; label: string };
   cautionWindow?: { start: string; end: string; label: string };
+  /**
+   * Chart-derived life theme (career/money/relationship/health/education/travel/business/
+   * spiritual/overall). Drives a theme-forward headline so different charts read differently
+   * even on the same day; falls back to the rating headline for `overall`/unset.
+   */
+  dominantTheme?: string;
 }

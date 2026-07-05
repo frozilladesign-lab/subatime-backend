@@ -5,9 +5,12 @@ import { DateTime } from 'luxon';
 import {
   buildNotificationCandidates,
   buildNotificationPlan,
+  computeChartContext,
+  type ChartContextResult,
   type FavorableHoraInput,
   type NotificationCandidates,
   type NotificationPlan,
+  type TransitLongitude,
 } from '@subatime/jyotisha-engine';
 import { PrismaService } from '../../../database/prisma.service';
 import { AlmanacService } from '../../calendar/almanac.service';
@@ -103,6 +106,33 @@ export interface PredictionPersonalization {
    * so feedback history nudges timing without crushing raw transit scores.
    */
   primaryContextScoreMultiplier: number;
+  /** Chart-derived life theme (8 areas) — set when a chart context was computed (P0). */
+  dominantTheme?: string;
+}
+
+/**
+ * Personalization audit — dev-mode proof that the prediction is chart-driven.
+ * Surfaced in the plan-day payload so simulator vs iPhone can be compared per profile.
+ */
+export interface PersonalizationAudit {
+  userId: string;
+  birthProfileHash: string;
+  chartHash: string;
+  lagna: string;
+  moonSign: string | null;
+  nakshatra: string;
+  currentDasha: string | null;
+  currentAntara: string | null;
+  activeLagnaHouses: { house: number; planet: string; theme: string }[];
+  activeMoonHouses: { house: number; planet: string; theme: string }[];
+  dashaHouseFromLagna: number | null;
+  topTransitInfluences: string[];
+  themeScores: Record<string, number> | null;
+  finalDominantTheme: string | null;
+  finalDominantContext: string;
+  topPersonalizationReasons: string[];
+  focusBoostApplied: boolean;
+  selectedTemplateIds: string[];
 }
 
 export interface DailyPredictionOutput {
@@ -116,6 +146,8 @@ export interface DailyPredictionOutput {
   transits: DayTransitDto[];
   confidenceScore: number;
   personalization: PredictionPersonalization;
+  /** Chart-driven personalization audit (dev-mode transparency). */
+  personalizationAudit?: PersonalizationAudit;
   /**
    * Single source of notification wording for this day (engine output). Delivery layers —
    * backend FCM schedulers and the Flutter local scheduler — select from this and never
@@ -163,6 +195,21 @@ export interface DailyPredictionOutput {
 const CHART_ACCURACY_WARNING =
   'Chart was calculated with approximate legacy mode. Results may be wrong near sign, ' +
   'nakṣatra, pāda, aspect, or house boundaries.';
+
+/** Deterministic short hash of any JSON-serializable value (FNV-1a, hex). */
+function stableHash(value: unknown): string {
+  const s = JSON.stringify(value) ?? '';
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+function cap(s: string): string {
+  return s.length ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
 
 @Injectable()
 export class DailyPredictionService {
@@ -511,10 +558,19 @@ export class DailyPredictionService {
       this.feedbackLearning.getWeightAdjustment(userId),
       this.feedbackLearning.getUserContextWeights(userId),
     ]);
+    // P0: the day's THEME comes from THIS user's chart (Lagna houses drive it, Moon colours
+    // it, Dasha weights the period), with focus areas only boosting. Two different charts on
+    // the same date now get genuinely different themes/reasons — not a shared "overall".
+    const chartFocusAreas = resolveNotificationSettings(
+      user.preferences,
+      user.birthProfile?.onboardingIntent,
+    ).settings.focusAreas;
+    const chartContext = this.computeChartContextFor(cd, predictionDay, chartFocusAreas);
     const personalization = this.buildPersonalization(
       contextWeights,
       this.personalizationIntentFor(user.preferences, user.birthProfile?.onboardingIntent),
       this.readOnboardingMoodsFromPreferences(user.preferences),
+      chartContext,
     );
     const chartNeedsVerification = cd?.degraded === true;
     const dataQuality = chartNeedsVerification
@@ -562,6 +618,7 @@ export class DailyPredictionService {
       goodTimes[0],
       confidenceScore,
       personalization.mostRelevantContext,
+      chartContext,
     );
     let summaryMethod: DailyPredictionOutput['meta']['method'] = 'weighted-score-v3-local';
     if (polishSummary && this.gemini.isConfigured()) {
@@ -761,6 +818,17 @@ export class DailyPredictionService {
       await this.upsertDaypartNotification(userId, 'daily_night', predictionDate, tz, 21, 30, nightPayload);
     }
 
+    const personalizationAudit = this.buildPersonalizationAudit({
+      userId,
+      cd,
+      lagna,
+      nakshatra,
+      janmaRasi,
+      chartContext,
+      dominantContext: personalization.mostRelevantContext,
+      selectedTemplateIds: (candidatesWithPlan.plan?.scheduled ?? []).map((s) => s.candidateId),
+    });
+
     return {
       predictionId: dailyPrediction.id,
       userId,
@@ -772,6 +840,7 @@ export class DailyPredictionService {
       confidenceScore,
       personalization,
       notificationCandidates: candidatesWithPlan,
+      personalizationAudit,
       meta: {
         lagna,
         nakshatra,
@@ -790,6 +859,103 @@ export class DailyPredictionService {
     };
   }
 
+
+  /**
+   * Chart-derived dominant theme (P0 personalization core). Computes today's transiting
+   * planet longitudes and runs the Lagna/Moon/Dasha/natal weighting engine so the daily
+   * theme comes from THIS user's chart — not a coarse default. Returns null when the chart
+   * lacks the longitudes needed (degraded charts) so the caller can fall back gracefully.
+   */
+  private computeChartContextFor(
+    cd: Record<string, unknown> | undefined,
+    predictionDay: Date,
+    focusAreas: string[],
+  ): ChartContextResult | null {
+    const asc = Number(cd?.ascendantLongitude);
+    const natalMoon = Number(cd?.moonLongitude);
+    if (!Number.isFinite(asc) || !Number.isFinite(natalMoon)) return null;
+
+    const ayanamsaMode = typeof cd?.ayanamsaMode === 'string' ? cd.ayanamsaMode : undefined;
+    // Transits at local-agnostic day noon (stable daily snapshot; fast Moon uses noon).
+    const noon = new Date(`${this.toDateString(predictionDay)}T12:00:00.000Z`);
+    const transits: TransitLongitude[] = [];
+    try {
+      transits.push({ planet: 'sun', longitude: this.chartService.sunSiderealLongitudeUtc(noon, ayanamsaMode) });
+      transits.push({ planet: 'moon', longitude: this.chartService.moonSiderealLongitudeUtc(noon, ayanamsaMode) });
+      for (const p of ['mars', 'jupiter', 'saturn', 'rahu', 'ketu'] as const) {
+        transits.push({ planet: p, longitude: this.chartService.planetSiderealLongitudeUtc(noon, p, ayanamsaMode) });
+      }
+    } catch {
+      return null;
+    }
+
+    const natalPlanets = this.readNatalPlanetLongitudes(cd);
+    const dasha = cd?.dasha as Record<string, unknown> | undefined;
+    const dashaLord = typeof dasha?.current === 'string' ? dasha.current : undefined;
+
+    return computeChartContext({
+      ascendantLongitude: asc,
+      natalMoonLongitude: natalMoon,
+      dashaLord,
+      natalPlanets,
+      transits,
+      focusAreas,
+    });
+  }
+
+  private readNatalPlanetLongitudes(cd: Record<string, unknown> | undefined): Record<string, number> {
+    const raw = cd?.planetLongitudes;
+    const out: Record<string, number> = {};
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+        const n = Number(v);
+        if (Number.isFinite(n)) out[k.toLowerCase()] = n;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Personalization audit — proves the chart drives the output (P0). Included in the
+   * plan-day payload in dev mode so the same day can be compared across profiles/devices.
+   */
+  private buildPersonalizationAudit(p: {
+    userId: string;
+    cd: Record<string, unknown> | undefined;
+    lagna: string;
+    nakshatra: string;
+    janmaRasi: string;
+    chartContext: ChartContextResult | null;
+    dominantContext: string;
+    selectedTemplateIds: string[];
+  }): PersonalizationAudit {
+    const dasha = p.cd?.dasha as Record<string, unknown> | undefined;
+    const ctx = p.chartContext;
+    return {
+      userId: p.userId,
+      birthProfileHash: stableHash({
+        asc: p.cd?.ascendantLongitude,
+        moon: p.cd?.moonLongitude,
+        planets: p.cd?.planetLongitudes,
+      }),
+      chartHash: stableHash({ lagna: p.lagna, nakshatra: p.nakshatra, dasha: dasha?.current }),
+      lagna: p.lagna,
+      moonSign: p.janmaRasi || null,
+      nakshatra: p.nakshatra,
+      currentDasha: typeof dasha?.current === 'string' ? dasha.current : null,
+      currentAntara: typeof dasha?.antara === 'string' ? dasha.antara : null,
+      activeLagnaHouses: ctx?.activeHousesFromLagna ?? [],
+      activeMoonHouses: ctx?.activeHousesFromMoon ?? [],
+      dashaHouseFromLagna: ctx?.dashaHouseFromLagna ?? null,
+      topTransitInfluences: ctx?.topTransitInfluences ?? [],
+      themeScores: ctx?.themeScores ?? null,
+      finalDominantTheme: ctx?.dominantTheme ?? null,
+      finalDominantContext: p.dominantContext,
+      topPersonalizationReasons: ctx?.reasons ?? [],
+      focusBoostApplied: ctx?.focusBoostApplied ?? false,
+      selectedTemplateIds: p.selectedTemplateIds,
+    };
+  }
 
   /**
    * Almanac-derived signals for notification candidates: favorable horā windows
@@ -924,6 +1090,7 @@ export class DailyPredictionService {
     bestBlock: TimeBlock | undefined,
     confidenceScore: number,
     mostRelevantContext: ContextKey,
+    chartContext?: ChartContextResult | null,
   ): string {
     const blockLabel = bestBlock ? `${bestBlock.start}-${bestBlock.end}` : '06:00-08:00';
     const tone =
@@ -938,15 +1105,44 @@ export class DailyPredictionService {
         : tone === 'cautionary but empowering'
           ? 'Move carefully and prioritize low-risk decisions.'
           : 'Use a steady pace and avoid overcommitting.';
-    const contextLine =
-      mostRelevantContext === 'career'
-        ? 'Career decisions carry the strongest relevance today.'
-        : mostRelevantContext === 'love'
-          ? 'Relationship communication has the strongest relevance today.'
-          : mostRelevantContext === 'health'
-            ? 'Health and balance choices have the strongest relevance today.'
-            : 'General day-planning has the strongest relevance today.';
-    return `Based on ${lagna} lagna and ${nakshatra}, your strongest action window is ${blockLabel}. ${angle} ${contextLine}`;
+
+    // P0: chart-specific, explainable theme line. Names the actual transit + house that
+    // makes this day's focus what it is for THIS chart — so two different charts read
+    // meaningfully differently even on the same date.
+    const themeLine = chartContext
+      ? this.chartThemeLine(chartContext)
+      : this.legacyContextLine(mostRelevantContext);
+
+    return `Based on ${lagna} lagna and ${nakshatra}, ${themeLine} Your strongest action window is ${blockLabel}. ${angle}`;
+  }
+
+  private chartThemeLine(ctx: ChartContextResult): string {
+    const theme = ctx.dominantTheme;
+    const focus: Record<string, string> = {
+      career: 'career and work themes are highlighted',
+      money: 'money and resources come into focus',
+      relationship: 'relationships and connection need care',
+      health: 'health, energy, and balance take priority',
+      education: 'learning and skill-building are favoured',
+      travel: 'movement, travel, and new horizons open up',
+      business: 'partnerships and business dealings are active',
+      spiritual: 'reflection and inner work are supported',
+      overall: 'the day favours steady, general planning',
+    };
+    const lead = focus[theme] ?? focus.overall;
+    // Prepend the strongest transit "why", when we have one.
+    const why = ctx.topTransitInfluences[0];
+    return why ? `${cap(why)} — ${lead} today.` : `${cap(lead)} today.`;
+  }
+
+  private legacyContextLine(mostRelevantContext: ContextKey): string {
+    return mostRelevantContext === 'career'
+      ? 'career decisions carry the strongest relevance today.'
+      : mostRelevantContext === 'love'
+        ? 'relationship communication has the strongest relevance today.'
+        : mostRelevantContext === 'health'
+          ? 'health and balance choices have the strongest relevance today.'
+          : 'general day-planning has the strongest relevance today.';
   }
 
   private muteLearningTipsFromPreferences(raw: unknown): boolean {
@@ -975,6 +1171,7 @@ export class DailyPredictionService {
     contextWeights: Record<string, number>,
     onboardingIntent?: string | null,
     onboardingMoods?: string[] | null,
+    chartContext?: ChartContextResult | null,
   ): PredictionPersonalization {
     const boosted: Record<string, number> = { ...contextWeights };
     const bump = (key: ContextKey, delta: number) => {
@@ -1042,16 +1239,28 @@ export class DailyPredictionService {
       }
     }
 
+    // Chart-derived context is the PRIMARY driver (P0). When present, it decides the
+    // dominant context; feedback/mood weights only fill the lower-signal ordering. Boost
+    // the chart context's weight so the block-scoring accent aligns with the theme.
+    if (chartContext) {
+      const ctx = chartContext.dominantContext as ContextKey;
+      boosted[ctx] = Number(Math.min(0.95, Math.max(boosted[ctx] ?? 0.5, 0.72)).toFixed(4));
+    }
+
     const contexts: ContextKey[] = ['career', 'love', 'health', 'overall'];
     const sorted = [...contexts].sort(
       (a, b) => (boosted[b] ?? 0.5) - (boosted[a] ?? 0.5),
     );
-    const rawPrimary = boosted[sorted[0]] ?? 0.5;
+    const primary: ContextKey = chartContext
+      ? (chartContext.dominantContext as ContextKey)
+      : sorted[0];
+    const rawPrimary = boosted[primary] ?? 0.5;
     return {
-      mostRelevantContext: sorted[0],
-      lowerSignalContexts: sorted.slice(2),
+      mostRelevantContext: primary,
+      lowerSignalContexts: sorted.filter((c) => c !== primary).slice(1),
       contextWeights: boosted,
       primaryContextScoreMultiplier: this.accentMultiplierFromContextWeight(rawPrimary),
+      ...(chartContext ? { dominantTheme: chartContext.dominantTheme } : {}),
     };
   }
 
@@ -1110,17 +1319,13 @@ export class DailyPredictionService {
         select: { preferences: true },
       }),
     ]);
-    const personalization = this.buildPersonalization(
-      contextWeights,
-      this.personalizationIntentFor(prefsRow?.preferences, profile?.onboardingIntent),
-      this.readOnboardingMoodsFromPreferences(prefsRow?.preferences),
-    );
-
     let lagna = '';
     let nakshatra = '';
     let siderealMoon = '';
     let taraNoon: { index1To9: number; name: string } | undefined;
     let chartNeedsVerification = false;
+    let chartContext: ChartContextResult | null = null;
+    let chartDataForAudit: Record<string, unknown> | undefined;
     if (profile?.id) {
       let chart = await this.prisma.astrologyChart.findFirst({
         where: { birthProfileId: profile.id },
@@ -1153,6 +1358,7 @@ export class DailyPredictionService {
         });
       }
       const cd = chart?.chartData as Record<string, unknown> | undefined;
+      chartDataForAudit = cd;
       chartNeedsVerification = cd?.degraded === true;
       if (typeof cd?.lagna === 'string') lagna = cd.lagna;
       if (typeof cd?.nakshatra === 'string') nakshatra = cd.nakshatra;
@@ -1164,7 +1370,20 @@ export class DailyPredictionService {
       if (nakshatra.trim().length > 0) {
         taraNoon = this.computeTaraAtLocalNoon(nakshatra, dateStr, tz, ay);
       }
+      // P0: chart-derived theme, recomputed on read so cache hits stay chart-personalized.
+      const focusAreas = resolveNotificationSettings(
+        prefsRow?.preferences,
+        profile.onboardingIntent,
+      ).settings.focusAreas;
+      chartContext = this.computeChartContextFor(cd, prediction.date, focusAreas);
     }
+
+    const personalization = this.buildPersonalization(
+      contextWeights,
+      this.personalizationIntentFor(prefsRow?.preferences, profile?.onboardingIntent),
+      this.readOnboardingMoodsFromPreferences(prefsRow?.preferences),
+      chartContext,
+    );
 
     const goodTimes = (prediction.goodTimes as TimeBlock[]) ?? [];
     const badTimes = (prediction.badTimes as TimeBlock[]) ?? [];
@@ -1172,6 +1391,9 @@ export class DailyPredictionService {
       ? Number(prediction.scoreSpread)
       : 0.35;
 
+    const candidatesForAudit = prediction.notificationCandidates as
+      | (NotificationCandidates & { plan?: NotificationPlan })
+      | undefined;
     const out: DailyPredictionOutput = {
       predictionId: prediction.id,
       userId: prediction.userId,
@@ -1185,6 +1407,16 @@ export class DailyPredictionService {
       ...(prediction.notificationCandidates != null
         ? { notificationCandidates: prediction.notificationCandidates as NotificationCandidates }
         : {}),
+      personalizationAudit: this.buildPersonalizationAudit({
+        userId: prediction.userId,
+        cd: chartDataForAudit,
+        lagna,
+        nakshatra,
+        janmaRasi: siderealMoon.trim(),
+        chartContext,
+        dominantContext: personalization.mostRelevantContext,
+        selectedTemplateIds: (candidatesForAudit?.plan?.scheduled ?? []).map((s) => s.candidateId),
+      }),
       meta: {
         lagna,
         nakshatra,
