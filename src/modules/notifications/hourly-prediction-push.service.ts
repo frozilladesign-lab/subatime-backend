@@ -4,6 +4,7 @@ import { NotificationType, Prisma } from '@prisma/client';
 import type { BlockNotificationCandidate, NotificationCandidates } from '@subatime/jyotisha-engine';
 import { PrismaService } from '../../database/prisma.service';
 import { DailyPredictionService } from '../prediction/services/daily-prediction.service';
+import { DigestService } from '../prediction/services/digest.service';
 import { FirebasePushService, isUnregisteredFcmError } from '../push/firebase-push.service';
 import { anyLocalScheduleFresh } from './local-schedule-freshness';
 
@@ -54,6 +55,7 @@ export class HourlyPredictionPushService {
     private readonly prisma: PrismaService,
     private readonly dailyPrediction: DailyPredictionService,
     private readonly push: FirebasePushService,
+    private readonly digest: DigestService,
   ) {}
 
   @Cron('*/5 * * * *')
@@ -66,6 +68,7 @@ export class HourlyPredictionPushService {
       select: {
         id: true,
         name: true,
+        language: true,
         preferences: true,
         birthProfile: { select: { timezone: true } },
         deviceTokens: { select: { token: true } },
@@ -107,9 +110,14 @@ export class HourlyPredictionPushService {
         const candidate = await this.blockCandidateFor(user.id, now, tz, block.start);
         if (!candidate) continue;
 
+        // Daily activation: the day's PEAK push adopts the AI daily message (from the weekly
+        // pack) as its body. Timing, block selection, and dedup are unchanged — this swaps the
+        // message text only, and only for the peak block. Other blocks keep engine copy.
+        const body = await this.resolveBlockBody(user.id, user.language, candidate, dateKey);
+
         // Persistent dedup: claim the (userId, date, candidateId, type) key BEFORE
         // sending. Safe across restarts, duplicate cron ticks, and multiple instances.
-        const job = await this.claimBlockFallbackJob(user.id, dateKey, candidate, now);
+        const job = await this.claimBlockFallbackJob(user.id, dateKey, candidate, now, body);
         if (!job) {
           this.logger.log(
             `[${block.label}] ${user.name ?? user.id.slice(0, 8)}: skipped_already_sent_or_queued`,
@@ -121,7 +129,7 @@ export class HourlyPredictionPushService {
         const result = await this.push.sendEachToTokens({
           tokens,
           title: candidate.title,
-          body:  candidate.body,
+          body,
           data: {
             type: 'feed',
             alertType: 'BLOCK_START',
@@ -134,7 +142,7 @@ export class HourlyPredictionPushService {
 
         if (result.successCount > 0) {
           sent += result.successCount;
-          this.logger.log(`[${block.label}] ${user.name ?? user.id.slice(0,8)}: sent_fcm_fallback "${candidate.title}" | "${candidate.body.slice(0,50)}"`);
+          this.logger.log(`[${block.label}] ${user.name ?? user.id.slice(0,8)}: sent_fcm_fallback "${candidate.title}" | "${body.slice(0,50)}"`);
         } else {
           // Keep the dedup row (no accidental resends) but record the failure.
           await this.prisma.notificationJob.update({
@@ -143,7 +151,7 @@ export class HourlyPredictionPushService {
               status: 'failed',
               payload: {
                 title: candidate.title,
-                body: candidate.body,
+                body,
                 candidateId: candidate.id,
                 error: 'fcm_all_tokens_failed',
               },
@@ -202,6 +210,32 @@ export class HourlyPredictionPushService {
   }
 
   /**
+   * The message body for a block push. For the day's PEAK block it prefers the AI daily
+   * message from the stored weekly pack (read-only — never calls Gemini); all other blocks and
+   * any fallback keep the engine-built candidate copy. The AI supplies TEXT only — this method
+   * is never consulted for timing, block choice, or dedup, so the scheduler stays in control.
+   * `overlay.provenance.locale` must match the user's language so we never mix languages.
+   */
+  private async resolveBlockBody(
+    userId: string,
+    language: 'en' | 'si',
+    candidate: BlockNotificationCandidate,
+    dateKey: string,
+  ): Promise<string> {
+    if (candidate.type !== 'peak') return candidate.body;
+    try {
+      const overlay = await this.digest.getWeeklyDailyOverlay(userId, dateKey);
+      if (overlay.source !== 'weekly_pack') return candidate.body;
+      const note = overlay.content?.notification?.trim();
+      const wantLocale = language === 'en' ? 'en' : 'si';
+      if (note && overlay.provenance?.locale === wantLocale) return note;
+    } catch {
+      // Keep engine copy on any error — the push must never depend on the AI layer.
+    }
+    return candidate.body;
+  }
+
+  /**
    * Claims the persistent dedup key by inserting the NotificationJob row (status `sent`,
    * delivered inline immediately after — the dispatcher only polls `pending`). Returns
    * null when the unique constraint reports the key as already claimed.
@@ -211,6 +245,7 @@ export class HourlyPredictionPushService {
     dateKey: string,
     candidate: BlockNotificationCandidate,
     now: Date,
+    body: string,
   ): Promise<{ id: string } | null> {
     try {
       return await this.prisma.notificationJob.create({
@@ -223,7 +258,7 @@ export class HourlyPredictionPushService {
           candidateId: candidate.id,
           payload: {
             title: candidate.title,
-            body: candidate.body,
+            body,
             candidateId: candidate.id,
             category: candidate.category ?? null,
             importance: candidate.importance ?? null,

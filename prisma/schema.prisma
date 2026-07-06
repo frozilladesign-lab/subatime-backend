@@ -401,6 +401,20 @@ model UserDigest {
   payload    Json
   /// scheduled | sent
   status     String   @default("scheduled")
+  /// AI-first content provenance. Content copy is Gemini-first with the deterministic engine
+  /// digest as fallback; these columns let us dedup + audit + regenerate correctly.
+  /// Where the copy came from: gemini | template. Null on rows predating the AI layer.
+  aiProvider String?
+  /// Outcome of the AI attempt: generated | fallback | failed. Null on legacy rows.
+  contentStatus String?
+  /// Prompt/output-contract version used (e.g. "digest-ai-v1"). Regenerate on mismatch.
+  promptVersion String?
+  /// Output language of the copy (en | si). A language switch regenerates the pack.
+  locale     String?
+  /// Hash of focusAreas + tones + locale. Regenerate when the user changes these.
+  focusHash  String?
+  /// Hash of derived chart facts (lagna + nakshatra). Regenerate when birth details change.
+  chartHash  String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)

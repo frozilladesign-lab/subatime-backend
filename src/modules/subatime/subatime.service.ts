@@ -169,6 +169,11 @@ export class SubatimeService {
       (base as Record<string, unknown>).transits = siTransits;
     }
 
+    // Daily activation: overlay today's AI wording from the stored weekly pack (read-only, no
+    // Gemini call here). Engine facts on `base` (rating, windows, lagna, notification timing)
+    // are untouched — only copy is added/replaced, and only when a fresh pack covers today.
+    await this.applyDailyAiOverlay(base, userId, dateIso, normalizedLang);
+
     setCachedPlanDayPayload(userId, dateIso, normalizedLang, base);
     return okResponse(base, 'Plan day fetched');
   }
@@ -1544,6 +1549,64 @@ export class SubatimeService {
     if (process.env.EXPOSE_PERSONALIZATION_AUDIT === 'true') return true;
     if (process.env.EXPOSE_PERSONALIZATION_AUDIT === 'false') return false;
     return process.env.NODE_ENV !== 'production';
+  }
+
+  /**
+   * Daily activation overlay. Adds today's AI copy (from the stored weekly pack) to the plan-day
+   * payload as an additive `aiCopy` block the Flutter Guide prefers over the deterministic
+   * key-based `copy`, and overlays the server prose `guidance`. Engine facts are never touched.
+   * Read-only: `getWeeklyDailyOverlay` never calls Gemini. Falls back silently to deterministic
+   * copy (already on `base`) when no fresh pack covers today or the language does not match.
+   */
+  private async applyDailyAiOverlay(
+    base: object,
+    userId: string,
+    dateIso: string,
+    lang: string,
+  ): Promise<void> {
+    const b = base as Record<string, unknown>;
+    let overlay;
+    try {
+      overlay = await this.digestService.getWeeklyDailyOverlay(userId, dateIso);
+    } catch {
+      return; // never block the Guide on the overlay lookup
+    }
+
+    // Only overlay when the stored pack's language matches the request, so an English request
+    // never receives Sinhala copy (or vice versa). Otherwise the client renders the
+    // deterministic key-based copy in the requested language.
+    const wantLocale = lang === 'si' ? 'si' : 'en';
+    const applied =
+      overlay.source === 'weekly_pack' &&
+      overlay.content != null &&
+      overlay.provenance?.locale === wantLocale;
+
+    if (applied && overlay.content) {
+      const c = overlay.content;
+      b.aiCopy = {
+        headline: c.headline,
+        summary: c.summary,
+        do: c.do,
+        avoid: c.avoid,
+        notification: c.notification,
+        locale: overlay.provenance?.locale ?? wantLocale,
+      };
+      b.guidance = c.summary;
+    }
+
+    if (this.exposePersonalizationAudit()) {
+      b.aiOverlayAudit = {
+        dailyCopySource: applied ? 'weekly_pack' : 'deterministic',
+        reason: applied ? null : (overlay.reason ?? 'lang_mismatch'),
+        periodKey: overlay.provenance?.periodKey ?? null,
+        aiProvider: overlay.provenance?.provider ?? null,
+        contentStatus: overlay.provenance?.status ?? null,
+        promptVersion: overlay.provenance?.promptVersion ?? null,
+        chartHash: overlay.provenance?.chartHash ?? null,
+        focusHash: overlay.provenance?.focusHash ?? null,
+        locale: overlay.provenance?.locale ?? null,
+      };
+    }
   }
 
   private toDayPayload(prediction: DailyPredictionOutput, userName?: string, lang = 'en') {

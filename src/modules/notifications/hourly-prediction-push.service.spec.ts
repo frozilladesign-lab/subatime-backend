@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { DailyPredictionService } from '../prediction/services/daily-prediction.service';
+import { DigestService } from '../prediction/services/digest.service';
 import { FirebasePushService } from '../push/firebase-push.service';
 import { HourlyPredictionPushService } from './hourly-prediction-push.service';
 
@@ -62,6 +63,8 @@ function makeService(opts: {
   storedCandidates?: unknown;
   pushSucceeds?: boolean;
   claimedKeys?: Set<string>;
+  userLanguage?: 'en' | 'si';
+  overlay?: unknown;
 }) {
   const sendEachToTokens = opts.pushSucceeds === false
     ? jest.fn(() =>
@@ -99,6 +102,7 @@ function makeService(opts: {
           {
             id: 'user-1',
             name: 'Nadia',
+            language: opts.userLanguage ?? 'en',
             preferences: {},
             birthProfile: { timezone: 'UTC' },
             deviceTokens: [{ token: 'tok-1' }],
@@ -119,9 +123,15 @@ function makeService(opts: {
   const generateForUser = jest.fn(() => Promise.resolve(null));
   const dailyPrediction = { generateForUser } as unknown as DailyPredictionService;
 
-  const service = new HourlyPredictionPushService(prisma, dailyPrediction, push);
+  const getWeeklyDailyOverlay = jest.fn(() =>
+    Promise.resolve(opts.overlay ?? { source: 'deterministic', reason: 'no_weekly_pack' }),
+  );
+  const digest = { getWeeklyDailyOverlay } as unknown as DigestService;
+
+  const service = new HourlyPredictionPushService(prisma, dailyPrediction, push, digest);
   return {
     service,
+    getWeeklyDailyOverlay,
     sendEachToTokens,
     dailyPredictionFindUnique,
     generateForUser,
@@ -222,7 +232,7 @@ describe('HourlyPredictionPushService (Phase 4 persistent DB dedup)', () => {
     await service.sendBlockNotifications(NOW);
 
     expect(notificationJob.create).toHaveBeenCalledTimes(1);
-    const created = (notificationJob.create.mock.calls[0][0] as { data: Record<string, unknown> }).data;
+    const created = notificationJob.create.mock.calls[0][0].data;
     expect(created.type).toBe('prediction_block_fallback');
     expect(created.candidateId).toBe('block-0600');
     expect(created.status).toBe('sent'); // delivered inline — dispatcher only polls pending
@@ -273,5 +283,86 @@ describe('HourlyPredictionPushService (Phase 4 persistent DB dedup)', () => {
     const upd = (notificationJob.update.mock.calls[0][0] as { data: Record<string, unknown> }).data;
     expect(upd.status).toBe('failed');
     expect((upd.payload as Record<string, unknown>).error).toBe('fcm_all_tokens_failed');
+  });
+});
+
+/** A PEAK block for the 06:00 window — the day's primary push, eligible for AI copy. */
+const BLOCK_0600_PEAK = {
+  ...BLOCK_0600_CANDIDATE,
+  id: 'block-0600',
+  type: 'peak',
+  title: '🌟 Morning Peak',
+  body: 'Engine peak-window copy.',
+};
+const STORED_PEAK = { ...STORED, blocks: [BLOCK_0600_PEAK] };
+
+const STALE_SCHEDULE = [
+  { ...FRESH_SCHEDULE, lastLocalScheduleAt: new Date('2026-07-01T05:30:00.000Z') },
+];
+
+const weeklyPackOverlay = (locale: 'en' | 'si', notification = 'AI daily notification message.') => ({
+  source: 'weekly_pack',
+  content: { date: '2026-07-04', notification },
+  provenance: { locale, periodKey: '2026-W27', provider: 'gemini', status: 'generated' },
+});
+
+describe('HourlyPredictionPushService (AI daily notification copy — timing stays engine-owned)', () => {
+  it('peak push adopts the AI notification message when a matching-language pack covers today', async () => {
+    const { service, sendEachToTokens, getWeeklyDailyOverlay } = makeService({
+      localSchedules: STALE_SCHEDULE,
+      storedCandidates: STORED_PEAK,
+      userLanguage: 'en',
+      overlay: weeklyPackOverlay('en'),
+    });
+
+    await service.sendBlockNotifications(NOW);
+
+    expect(getWeeklyDailyOverlay).toHaveBeenCalledWith('user-1', '2026-07-04');
+    const call = (sendEachToTokens.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
+    expect(call.body).toBe('AI daily notification message.'); // AI copy
+    expect(call.title).toBe(BLOCK_0600_PEAK.title); // engine title unchanged (timing/identity)
+    expect((call.data as Record<string, string>).candidateId).toBe('block-0600'); // same engine block/timing
+  });
+
+  it('non-peak block keeps engine copy even when a pack exists', async () => {
+    const { service, sendEachToTokens } = makeService({
+      localSchedules: STALE_SCHEDULE,
+      storedCandidates: STORED, // caution block
+      userLanguage: 'en',
+      overlay: weeklyPackOverlay('en'),
+    });
+
+    await service.sendBlockNotifications(NOW);
+
+    const call = (sendEachToTokens.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
+    expect(call.body).toBe(BLOCK_0600_CANDIDATE.body); // engine copy, not AI
+  });
+
+  it('peak push keeps engine copy when the pack language differs from the user language', async () => {
+    const { service, sendEachToTokens } = makeService({
+      localSchedules: STALE_SCHEDULE,
+      storedCandidates: STORED_PEAK,
+      userLanguage: 'en',
+      overlay: weeklyPackOverlay('si'), // Sinhala pack, English user
+    });
+
+    await service.sendBlockNotifications(NOW);
+
+    const call = (sendEachToTokens.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
+    expect(call.body).toBe(BLOCK_0600_PEAK.body); // no language mixing
+  });
+
+  it('peak push keeps engine copy when no weekly pack covers today (deterministic overlay)', async () => {
+    const { service, sendEachToTokens } = makeService({
+      localSchedules: STALE_SCHEDULE,
+      storedCandidates: STORED_PEAK,
+      userLanguage: 'en',
+      // default overlay = { source: 'deterministic' }
+    });
+
+    await service.sendBlockNotifications(NOW);
+
+    const call = (sendEachToTokens.mock.calls[0] as unknown[])[0] as Record<string, unknown>;
+    expect(call.body).toBe(BLOCK_0600_PEAK.body);
   });
 });
